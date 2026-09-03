@@ -13,10 +13,12 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import asdict, dataclass
@@ -521,9 +523,12 @@ def _download_and_install_ffmpeg(log: LogFn) -> None:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     urls = _ffmpeg_urls()
     errors: list[str] = []
-    for url in urls:
+    archive = DOWNLOAD_DIR / "ffmpeg-release.zip"
+    for source_index, url in enumerate(urls):
+        if source_index:
+            archive.unlink(missing_ok=True)
+            archive.with_suffix(archive.suffix + ".part").unlink(missing_ok=True)
         try:
-            archive = DOWNLOAD_DIR / "ffmpeg-release.zip"
             _download_file(url, archive, log)
             _extract_ffmpeg_archive(archive, log)
             return
@@ -552,25 +557,83 @@ def _ffmpeg_urls() -> list[str]:
 
 
 def _download_file(url: str, out_path: Path, log: LogFn) -> None:
-    log(f"[依赖检测] 下载 FFmpeg：{url}")
-    request = urllib.request.Request(url, headers={"User-Agent": "novel-video-pipeline/1.0"})
-    with urllib.request.urlopen(request, timeout=60) as response:
-        total = int(response.headers.get("Content-Length", "0") or "0")
-        done = 0
-        next_log = 32 * 1024 * 1024
-        with out_path.open("wb") as handle:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                handle.write(chunk)
-                done += len(chunk)
-                if done >= next_log:
-                    if total:
-                        log(f"[依赖检测] FFmpeg 已下载 {done / 1024 / 1024:.0f}/{total / 1024 / 1024:.0f} MB")
-                    else:
-                        log(f"[依赖检测] FFmpeg 已下载 {done / 1024 / 1024:.0f} MB")
-                    next_log += 32 * 1024 * 1024
+    """Download a zip with bounded reads, retries and HTTP Range resume."""
+    if out_path.is_file() and zipfile.is_zipfile(out_path):
+        log(f"[依赖检测] 复用已下载的 FFmpeg 压缩包：{out_path}")
+        return
+    out_path.unlink(missing_ok=True)
+    part_path = out_path.with_suffix(out_path.suffix + ".part")
+    read_timeout = max(10, int(os.environ.get("NOVEL_VIDEO_DOWNLOAD_READ_TIMEOUT", "30") or 30))
+    total_timeout = max(60, int(os.environ.get("NOVEL_VIDEO_DOWNLOAD_TOTAL_TIMEOUT", "1200") or 1200))
+    max_attempts = max(1, int(os.environ.get("NOVEL_VIDEO_DOWNLOAD_RETRIES", "3") or 3))
+    started = time.monotonic()
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        if part_path.is_file() and zipfile.is_zipfile(part_path):
+            part_path.replace(out_path)
+            log(f"[依赖检测] FFmpeg 断点文件已完整，直接复用：{out_path}")
+            return
+        if time.monotonic() - started >= total_timeout:
+            raise TimeoutError(f"FFmpeg 下载超过总时限 {total_timeout} 秒")
+        resume_at = part_path.stat().st_size if part_path.exists() else 0
+        headers = {"User-Agent": "novel-video-pipeline/1.0", "Accept-Encoding": "identity"}
+        if resume_at:
+            headers["Range"] = f"bytes={resume_at}-"
+            log(f"[依赖检测] 继续下载 FFmpeg：已完成 {resume_at / 1024 / 1024:.1f} MB（第 {attempt}/{max_attempts} 次）")
+        else:
+            log(f"[依赖检测] 下载 FFmpeg（第 {attempt}/{max_attempts} 次）：{url}")
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=read_timeout) as response:
+                status = int(getattr(response, "status", 200) or 200)
+                content_range = str(response.headers.get("Content-Range", "") or "")
+                resumed = bool(resume_at and status == 206 and content_range.lower().startswith(f"bytes {resume_at}-"))
+                if resume_at and not resumed:
+                    log("[依赖检测] 下载源不支持断点续传，重新从 0 MB 下载。")
+                    resume_at = 0
+                length = int(response.headers.get("Content-Length", "0") or "0")
+                total_match = re.search(r"/(\d+)$", content_range)
+                total = int(total_match.group(1)) if total_match else (resume_at + length if length else 0)
+                done = resume_at
+                next_bytes_log = done + 4 * 1024 * 1024
+                next_time_log = time.monotonic() + 10
+                mode = "ab" if resumed else "wb"
+                with part_path.open(mode) as handle:
+                    while True:
+                        elapsed = time.monotonic() - started
+                        if elapsed >= total_timeout:
+                            raise TimeoutError(f"FFmpeg 下载超过总时限 {total_timeout} 秒")
+                        chunk = response.read(256 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        done += len(chunk)
+                        now = time.monotonic()
+                        if done >= next_bytes_log or now >= next_time_log:
+                            if total:
+                                log(f"[依赖检测] FFmpeg 已下载 {done / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB")
+                            else:
+                                log(f"[依赖检测] FFmpeg 已下载 {done / 1024 / 1024:.1f} MB")
+                            next_bytes_log = done + 4 * 1024 * 1024
+                            next_time_log = now + 10
+                if total and done < total:
+                    raise EOFError(f"下载提前结束：{done}/{total} bytes")
+            if not zipfile.is_zipfile(part_path):
+                raise zipfile.BadZipFile("下载结果不是有效 ZIP，可能是不完整文件或错误页面")
+            part_path.replace(out_path)
+            log(f"[依赖检测] FFmpeg 下载完成：{done / 1024 / 1024:.1f} MB")
+            return
+        except (socket.timeout, TimeoutError, EOFError, urllib.error.URLError, zipfile.BadZipFile) as exc:
+            last_error = exc
+            kept = part_path.stat().st_size if part_path.exists() else 0
+            log(
+                f"[依赖检测] FFmpeg 下载中断（第 {attempt}/{max_attempts} 次）：{exc}；"
+                f"已保留 {kept / 1024 / 1024:.1f} MB。"
+            )
+            if isinstance(exc, zipfile.BadZipFile):
+                part_path.unlink(missing_ok=True)
+    raise TimeoutError(f"FFmpeg 下载重试 {max_attempts} 次后失败：{last_error}")
 
 
 def _extract_ffmpeg_archive(archive: Path, log: LogFn) -> None:
@@ -694,10 +757,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Check and repair novel_video_pipeline dependencies")
     parser.add_argument("--ensure", action="store_true", help="check full dependencies and install what is enabled")
     parser.add_argument("--ensure-core", action="store_true", help="check only GUI core Python packages")
+    parser.add_argument("--ensure-ffmpeg", action="store_true", help="ensure FFmpeg and return a strict exit status")
     parser.add_argument("--ensure-ffmpeg-subtitles", action="store_true", help="ensure macOS ffmpeg-full/libass only")
     args = parser.parse_args()
     if args.ensure_ffmpeg_subtitles:
         status = ensure_ffmpeg(print)
+        return 0 if status.ok else 1
+    if args.ensure_ffmpeg:
+        status = ensure_ffmpeg(print)
+        print("[依赖检测] " + ("FFmpeg 已就绪" if status.ok else status.detail))
         return 0 if status.ok else 1
     scope = "core" if args.ensure_core else "full"
     report = ensure_dependencies(scope=scope, on_log=print)

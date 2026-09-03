@@ -49,5 +49,14 @@ PowerShell 后运行：
 powershell -ExecutionPolicy Bypass -File .\scripts\setup_windows.ps1 -Rebuild
 ```
 
+FFmpeg 下载使用 `data\downloads\ffmpeg-release.zip.part` 保存断点，读取连续 30 秒
+没有数据会自动重试，默认最多 3 次。重新运行安装器会继续已有断点。需要调整时可在
+PowerShell 中设置 `NOVEL_VIDEO_DOWNLOAD_READ_TIMEOUT`、
+`NOVEL_VIDEO_DOWNLOAD_TOTAL_TIMEOUT` 或 `NOVEL_VIDEO_DOWNLOAD_RETRIES`。
+
+安装成功会写入 `data\runtime\windows_setup_complete.json`。主启动器使用项目绝对路径
+检查 `.venv\Scripts\python.exe` 和核心包；旧环境即使没有完成标记，只要运行环境有效，
+也会直接启动，不会误报为首次安装。
+
 在线更新会保护 `data\settings.json`、`data\profiles`、任务、项目、浏览器登录目录和
 本机运行缓存。发布前同样禁止把这些本机数据放进发行包。

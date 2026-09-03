@@ -9,6 +9,9 @@ Set-Location $ProjectRoot
 $env:NO_PROXY = "localhost,127.0.0.1,::1"
 $env:no_proxy = $env:NO_PROXY
 $env:PYTHONUTF8 = "1"
+$env:PYTHONUNBUFFERED = "1"
+$RuntimeDir = Join-Path $ProjectRoot "data\runtime"
+$SetupMarker = Join-Path $RuntimeDir "windows_setup_complete.json"
 
 function Test-PythonCommand {
     param([string]$Executable, [string[]]$Prefix = @())
@@ -100,10 +103,24 @@ if ($LASTEXITCODE -ne 0) {
     Write-Warning "Playwright Chromium 安装失败；主程序仍可运行，但 YouTube 上传需要 Chrome/Edge。"
 }
 
-Write-Host "[setup] 正在检测 FFmpeg、浏览器和上传组件..."
+Write-Host "[setup] 正在安装或验证 FFmpeg（支持超时、重试和断点续传）..."
+& $VenvPython -m app.dependency_manager --ensure-ffmpeg
+if ($LASTEXITCODE -ne 0) {
+    throw "FFmpeg 安装失败。已下载的 .part 文件会保留供下次续传；请检查网络后重新运行安装器。"
+}
+
+Write-Host "[setup] 正在检测浏览器和上传组件..."
 & $VenvPython -m app.dependency_manager --ensure
 if ($LASTEXITCODE -ne 0) {
     Write-Warning "部分可选依赖尚未就绪。可启动 GUI 后在“依赖检测”中重试。"
 }
 
+New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
+@{
+    completed = $true
+    completed_at = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    python = $VenvPython
+    python_version = $PythonVersion
+} | ConvertTo-Json | Set-Content -LiteralPath $SetupMarker -Encoding UTF8
 Write-Host "[setup] Windows 运行环境已就绪。"
+Write-Host "[setup] 完成标记：$SetupMarker"
