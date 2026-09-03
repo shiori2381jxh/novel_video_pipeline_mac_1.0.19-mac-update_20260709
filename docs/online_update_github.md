@@ -3,22 +3,24 @@
 软件已经内置“软件更新”页。推荐使用公开 release 仓库发布更新包。macOS GUI 从
 `latest.json` 检查更新，Windows GUI 从 `latest-windows.json` 检查更新。
 
+两个平台必须从同一个 commit、同一个无平台后缀的版本号和 tag 构建。平台清单可以
+分开，但核心 `app/`、GUI、配置结构和功能模块不能分叉。
+
 macOS 更新到 1.0.21 及以上后，程序启动时会检测 FFmpeg 的 ASS 字幕能力。仅在缺少 `libass` 时通过 Homebrew 一次性安装并优先使用 `ffmpeg-full`；后续启动检测通过即跳过，不会重复安装。
 
 ## 仓库建议
 
-推荐保持三仓库结构：
+推荐让 macOS 与 Windows 共用一个源码与 Release 仓库：
 
 | 仓库 | 用途 |
 | --- | --- |
-| `1951779219/novel_video_pipeline` | 私有源码仓库 |
-| `1951779219/novel_video_pipeline_mac_release` | 公开发布仓库，放更新 zip 和 `latest.json` |
+| `shiori2381jxh/novel_video_pipeline_mac_1.0.19-mac-update_20260709` | 跨平台源码与 Release；同时放两种 ZIP 和两份清单 |
 | `1951779219/novel_video_pipeline_feedback` | 公开反馈仓库 |
 
 GUI 默认读取：
 
 ```text
-https://github.com/1951779219/novel_video_pipeline_mac_release/releases/latest/download/latest.json
+https://github.com/shiori2381jxh/novel_video_pipeline_mac_1.0.19-mac-update_20260709/releases/latest/download/latest.json
 ```
 
 如果换仓库，改 GUI 的 `更新清单 URL`，或改 `data/settings.json` 里的 `update_manifest_url`。
@@ -52,10 +54,10 @@ RELEASE_REPO=1951779219/novel_video_pipeline_mac_release ./scripts/publish_githu
 只打包不上传：
 
 ```bash
-python3 scripts/build_release_package.py --repo 1951779219/novel_video_pipeline_mac_release
+python3 scripts/build_release_package.py --platform all --repo shiori2381jxh/novel_video_pipeline_mac_1.0.19-mac-update_20260709
 ```
 
-Windows 包：
+也可以只构建 Windows 包用于调试：
 
 ```bash
 python3 scripts/build_release_package.py --platform windows --repo OWNER/REPO
@@ -68,10 +70,9 @@ dist/novel_video_pipeline_mac_<version>_<date>.zip
 dist/latest.json
 ```
 
-Windows 构建对应输出 `dist/novel_video_pipeline_windows_*.zip` 和
-`dist/latest-windows.json`。如果 macOS 与 Windows 共用一个仓库，每次最新 Release
-应同时携带两份平台清单；暂时没有新版的平台，可以沿用上一版本清单。这样 GitHub 的
-`releases/latest` 切换时不会让另一平台断更。
+完整构建输出两种 ZIP、`latest.json` 和 `latest-windows.json`。两个清单中的
+`version`、`source_commit` 和 `gui_sha256` 必须一致，每个最新 Release 必须同时上传
+这四个文件，避免某个平台断更。
 
 `latest.json` 结构：
 

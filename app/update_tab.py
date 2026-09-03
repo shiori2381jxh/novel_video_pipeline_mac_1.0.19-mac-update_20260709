@@ -1,6 +1,7 @@
 """Tkinter update tab."""
 from __future__ import annotations
 
+import os
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -45,7 +46,8 @@ class UpdateTab:
 
         self._progress = ttk.Progressbar(box, maximum=100, mode="determinate")
         self._progress.pack(fill=tk.X, pady=(10, 0))
-        self._status = ttk.Label(box, text="从 GitHub Release 读取 latest.json；应用更新时会保留 data/settings.json、profiles、jobs 和浏览器登录态。", foreground="#555")
+        manifest_name = "latest-windows.json" if os.name == "nt" else "latest.json"
+        self._status = ttk.Label(box, text=f"从 GitHub Release 读取 {manifest_name}；应用更新时会保留 data/settings.json、profiles、jobs 和浏览器登录态。", foreground="#555")
         self._status.pack(anchor=tk.W, pady=(6, 0))
 
         notes = ttk.LabelFrame(self.frame, text="发布说明", padding=8)

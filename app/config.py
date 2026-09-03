@@ -69,6 +69,9 @@ PROFILE_CONNECTION_FIELDS = API_KEY_FIELDS | {
     *(f"relay_station_{index}_{field}" for index in range(1, 7) for field in ("name", "base_url", "text_model", "image_model")),
 }
 PROFILE_LOCAL_FIELDS = PROFILE_CONNECTION_FIELDS | {
+    # Update channels belong to the installed operating system, not to a
+    # production recipe. Switching profiles must never switch platforms.
+    "update_manifest_url",
     "deleted_profiles",
     "task_category_root",
     "task_category_selected_path",

@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import stat
+import subprocess
 import time
 import zipfile
 from pathlib import Path
@@ -49,6 +50,24 @@ def version() -> str:
     from app.version import VERSION
 
     return str(VERSION)
+
+
+def source_commit() -> str:
+    """Return the exact source commit used for both platform artifacts."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except Exception:
+        return ""
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def api_key_fields() -> set[str]:
@@ -199,22 +218,30 @@ def build_asset_url(repo: str, tag: str, zip_name: str, explicit: str = "") -> s
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build a scrubbed Windows or macOS release package.")
     parser.add_argument("--output-dir", default=str(DIST))
-    parser.add_argument("--platform", choices=("macos", "windows"), default="macos")
-    parser.add_argument("--repo", default="1951779219/novel_video_pipeline_mac_release", help="GitHub release repo owner/name")
+    parser.add_argument("--platform", choices=("macos", "windows", "all"), default="all")
+    parser.add_argument("--repo", default="shiori2381jxh/novel_video_pipeline_mac_1.0.19-mac-update_20260709", help="GitHub release repo owner/name")
     parser.add_argument("--asset-url", default="", help="Explicit package download URL")
     parser.add_argument("--notes", default="", help="Release notes for latest.json")
     parser.add_argument("--notes-file", default="", help="Release notes file")
     args = parser.parse_args()
 
+    platforms = ("macos", "windows") if args.platform == "all" else (args.platform,)
+    for target_platform in platforms:
+        build_platform_release(args, target_platform)
+    return 0
+
+
+def build_platform_release(args: argparse.Namespace, target_platform: str) -> tuple[Path, Path, str]:
+    """Build one platform payload from the current shared source tree."""
     ver = version()
     tag = f"v{ver}"
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    platform_slug = "windows" if args.platform == "windows" else "mac"
+    platform_slug = "windows" if target_platform == "windows" else "mac"
     package_name = f"novel_video_pipeline_{platform_slug}_{safe_slug(ver)}_{time.strftime('%Y%m%d')}"
     staging = output_dir / package_name
     zip_path = output_dir / f"{package_name}.zip"
-    manifest_name = "latest-windows.json" if args.platform == "windows" else "latest.json"
+    manifest_name = "latest-windows.json" if target_platform == "windows" else "latest.json"
     latest_path = output_dir / manifest_name
 
     if staging.exists():
@@ -223,9 +250,9 @@ def main() -> int:
         zip_path.unlink()
     staging.mkdir(parents=True)
 
-    copy_source(staging, args.platform)
-    copy_sanitized_data(staging, args.platform)
-    if args.platform == "macos":
+    copy_source(staging, target_platform)
+    copy_sanitized_data(staging, target_platform)
+    if target_platform == "macos":
         chmod_commands(staging)
     digest = make_zip(staging, zip_path)
 
@@ -235,7 +262,7 @@ def main() -> int:
         if notes_file.exists():
             notes = notes_file.read_text(encoding="utf-8")
     if not notes:
-        platform_name = "Windows" if args.platform == "windows" else "macOS"
+        platform_name = "Windows" if target_platform == "windows" else "macOS"
         notes = f"Novel Video Pipeline {ver} {platform_name} update."
 
     manifest = {
@@ -244,13 +271,16 @@ def main() -> int:
         "sha256": digest,
         "notes": notes.strip(),
         "mandatory": False,
-        "platform": args.platform,
+        "platform": target_platform,
+        "source_version": ver,
+        "source_commit": source_commit(),
+        "gui_sha256": file_sha256(ROOT / "app" / "gui.py"),
     }
     latest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(zip_path)
     print(latest_path)
     print(digest)
-    return 0
+    return zip_path, latest_path, digest
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import unittest
 
+from app import config as config_module
 from scripts import apply_update, build_release_package
 
 
@@ -19,6 +20,14 @@ class WindowsReleaseTests(unittest.TestCase):
         self.assertIn("启动.bat", files)
         self.assertIn("Install_Windows_Dependencies.bat", files)
         self.assertIn("Install_VoxCPM.bat", files)
+
+    def test_update_channel_is_not_part_of_production_profiles(self):
+        self.assertIn("update_manifest_url", config_module.PROFILE_LOCAL_FIELDS)
+
+    def test_shared_version_has_no_platform_suffix(self):
+        version = build_release_package.version()
+        self.assertNotIn("windows", version.lower())
+        self.assertNotIn("mac", version.lower())
 
 
 if __name__ == "__main__":
