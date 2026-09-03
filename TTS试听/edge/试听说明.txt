@@ -1,0 +1,5 @@
+Edge TTS 音色试听
+
+文件编号与 GUI 内置音色顺序一致。试听文案会根据音色地区使用简体中文、繁体中文、日语、英语、韩语、西语、法语或德语。
+
+11_ja-JP-AoiNeural 与 12_ja-JP-DaichiNeural 当前已不在 Microsoft Edge 可用目录中，因此没有生成；GUI 会继续实时检测可用音色。

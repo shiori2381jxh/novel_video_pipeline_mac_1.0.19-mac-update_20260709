@@ -1,0 +1,3 @@
+ElevenLabs TTS 试听
+
+在 GUI 中选择 elevenlabs，填写可用的 API Key、模型和 voice ID，然后点击“生成当前音色试听”。生成结果会保存在本目录。

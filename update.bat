@@ -83,6 +83,10 @@ for %%f in (
     README.md
     requirements.txt
     update.bat
+    Install_Windows_Dependencies.bat
+    Install_VoxCPM.bat
+    Chrome调试模式启动.bat
+    Seedance画布.bat
     启动.bat
     桌面GUI.bat
 ) do (

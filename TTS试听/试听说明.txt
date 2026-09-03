@@ -1,7 +1,10 @@
-TTS 音色试听
+TTS Provider 试听库
 
-每个 MP3 都会先问候、自我介绍音色名，再读一段测试旁白。文案会按音色的语言地区分别使用简体中文、繁体中文、日语、英语、韩语、西语、法语或德语，不会让所有音色机械地朗读中文。
+试听文件按 Provider 分开保存：
+- edge：内置 Edge 音色试听。
+- voxcpm：本地 VoxCPM2 收藏音色试听。
+- openai / azure / elevenlabs / custom：在 GUI 配好对应账号后，点击“生成当前音色试听”生成。
 
-文件已按界面内置音色顺序编号。直接在 Finder 中选中 MP3 后按空格即可试听，或双击播放。
+VOICEVOX 不在这里重复生成，请直接在 VOICEVOX 软件中试听。
 
-注意：11_ja-JP-AoiNeural 与 12_ja-JP-DaichiNeural 当前已不在 Microsoft Edge 可用音色目录中，因此没有生成。GUI 会自动检测可用音色；当前可用的日语音色为 Nanami 与 Keita。
+在 Finder 中选中 MP3 后按空格即可试听，也可以直接双击播放。

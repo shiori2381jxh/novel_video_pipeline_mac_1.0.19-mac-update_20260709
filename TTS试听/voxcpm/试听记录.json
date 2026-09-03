@@ -1,0 +1,37 @@
+{
+  "01_男｜沉稳磁性.mp3": {
+    "provider": "voxcpm",
+    "voice": "男｜沉稳磁性",
+    "model": "openbmb/VoxCPM2",
+    "duration": 8.16,
+    "generated_at": "2026-09-03 14:47:40"
+  },
+  "02_男｜自然情感.mp3": {
+    "provider": "voxcpm",
+    "voice": "男｜自然情感",
+    "model": "openbmb/VoxCPM2",
+    "duration": 7.84,
+    "generated_at": "2026-09-03 14:48:05"
+  },
+  "03_女｜清亮自然.mp3": {
+    "provider": "voxcpm",
+    "voice": "女｜清亮自然",
+    "model": "openbmb/VoxCPM2",
+    "duration": 8.48,
+    "generated_at": "2026-09-03 14:48:39"
+  },
+  "04_女｜低沉稳重.mp3": {
+    "provider": "voxcpm",
+    "voice": "女｜低沉稳重",
+    "model": "openbmb/VoxCPM2",
+    "duration": 8.0,
+    "generated_at": "2026-09-03 14:49:20"
+  },
+  "05_女｜大气情感.mp3": {
+    "provider": "voxcpm",
+    "voice": "女｜大气情感",
+    "model": "openbmb/VoxCPM2",
+    "duration": 8.96,
+    "generated_at": "2026-09-03 14:50:30"
+  }
+}

@@ -21,6 +21,27 @@
 
 ## 启动
 
+### Windows 10/11
+
+推荐使用 64 位 Windows 10/11。首次使用双击：
+
+```text
+Install_Windows_Dependencies.bat
+```
+
+安装器会查找 Python 3.10～3.12（优先 3.12），没有 Python 时会尝试通过
+`winget` 安装；随后创建独立的 `.venv`、安装 Python 包与 Playwright Chromium，
+并检测或下载 FFmpeg。完成后固定双击：
+
+```text
+启动.bat
+```
+
+`桌面GUI.bat` 是同一入口的兼容别名。项目可放在任意可写目录，建议路径不要过长；
+不需要 WebUI 常驻进程。完整说明见 `docs/windows_installation.md`。
+
+### macOS
+
 macOS 首次使用：
 
 ```bash
@@ -36,24 +57,6 @@ scripts/start_gui_macos.command
 ```
 
 复制到其他 Mac 使用时，建议先运行 `scripts/setup_macos.sh`，之后固定双击 `Open_GUI.command`。应用默认启动桌面 GUI，不需要 WebUI 常驻进程。
-
-双击：
-
-```bat
-启动.bat
-```
-
-或在项目目录运行桌面 GUI：
-
-```bat
-python -m app.gui
-```
-
-生产使用建议启动桌面 GUI：
-
-```bat
-桌面GUI.bat
-```
 
 桌面 GUI 面向工作人员批量生产：支持番茄搜索加入任务、粘贴文章、导入多个 TXT、查看每个任务实时日志、保存 TTS/图片/节奏/字幕/上传配置、启动多个待处理任务。左侧“任务分类”页可以选择已导入任务的文本来源根目录，按目录及子目录筛选任务，并按名称自然顺序、添加日期、原文修改日期、任务更新时间或制作阶段排序；切回书库/文件导入页会恢复全部任务的默认顺序。任务仍然走独立 worker 进程和 manifest 续跑机制。
 
@@ -456,6 +459,22 @@ app/
 data/jobs/
 ```
 
+### VoxCPM2 收藏音色（本地，可选）
+
+项目已集成 `vendor/voxcpm-favorite-voices` 收藏音色包。首次使用时，Windows 双击
+`Install_VoxCPM.bat`，macOS 双击 `Install_VoxCPM.command` 安装官方运行库，然后在 GUI 中选择
+`TTS Provider = voxcpm` 和收藏音色。Windows 有兼容的 NVIDIA/CUDA 环境时自动使用 CUDA，
+Apple Silicon 默认使用 MPS；VoxCPM 固定为单路生成。
+模型在同一任务内只加载一次。首次真实合成会从 Hugging Face 下载
+`openbmb/VoxCPM2`（数 GB），以后复用本机缓存。情感/指令留空时使用音色包自带描述，
+填写后则覆盖该描述。
+
+“TTS”设置区的“生成当前音色试听”会调用当前 Provider 的真实配置，并把结果保存到
+`TTS试听/{provider}/`。Edge、VoxCPM 和已配置凭据的 OpenAI、Azure、ElevenLabs、
+custom 均使用各自目录；VOICEVOX 请直接在其软件内试听，因此不会重复生成。
+VoxCPM 试听文件还支持反向同步命名：直接修改 MP3 文件名并保留 `01_`～`05_`
+编号，下次展开 GUI 的 VoxCPM 音色下拉框时就会显示新名称。
+
 ## 稳定性增强
 
 当前版本已吸收 HUANCUN MVP 中最适合本项目的轻量机制：
@@ -501,9 +520,15 @@ macOS 启动调试 Chrome：
 scripts/start_chrome_debug_macos.command
 ```
 
+Windows 双击：
+
+```text
+Chrome调试模式启动.bat
+```
+
 如果本机没有安装 Google Chrome，`scripts/setup_macos.sh` 会下载 Playwright Chromium，调试启动脚本会自动使用它。
 
-上传选择视频和封面时，macOS 会直接通过 Playwright 设置本地文件路径，不依赖原生文件选择框焦点，因此从桌面 GUI 发起上传更稳定。
+上传选择视频和封面时，macOS 会直接通过 Playwright 设置本地文件路径；Windows 保留原生文件对话框兼容流程。
 
 ## 封面生成
 

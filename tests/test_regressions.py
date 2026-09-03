@@ -14,9 +14,21 @@ from app import project_manager
 from app.gui import PipelineGUI, _choose_import_folders
 from app.character_analysis import normalize_analysis
 from app.backends.image import ImageBackend
-from app.backends.tts import edge_voice_choices, preferred_available_edge_voice
+from app.backends import tts as tts_backend_module
+from app.backends.tts import (
+    TTSBackend,
+    VOXCPM_FAVORITE_VOICES,
+    VOXCPM_VOICE_BUNDLE,
+    VOXCPM_VOICE_CATALOG,
+    edge_voice_choices,
+    normalize_voxcpm_voice,
+    preferred_available_edge_voice,
+    voxcpm_voice_choices,
+    voxcpm_voice_display,
+)
 from app.stages.stage6_compose import _video_encoder_args
 from app.storyboard_highlights import parse_json_object
+from app.tts_audition import audition_directory, audition_filename, audition_text_for_voice
 
 
 class ImagePromptRegressionTests(unittest.TestCase):
@@ -709,6 +721,56 @@ class PronunciationDictionaryRegressionTests(unittest.TestCase):
         self.assertEqual(counts, [0])
         self.assertEqual(entries, [])
         self.assertEqual(dictionary_hash, "")
+
+
+class VoxCPMRegressionTests(unittest.TestCase):
+    def test_favorite_voice_catalog_resolves_every_reference_audio(self):
+        self.assertIn("男｜自然情感", VOXCPM_FAVORITE_VOICES)
+        self.assertGreaterEqual(len(VOXCPM_FAVORITE_VOICES), 5)
+        for row in VOXCPM_VOICE_CATALOG.values():
+            self.assertTrue((VOXCPM_VOICE_BUNDLE / "favorite_voices" / row["file"]).is_file())
+
+    def test_voxcpm_ignores_subprocess_isolation_to_reuse_loaded_model(self):
+        backend = TTSBackend("voxcpm", "男｜自然情感")
+        with (
+            patch.dict(pipeline_runner.config._data, {"tts_subprocess_isolation": True}),
+            patch.object(backend, "synth", return_value=1.25) as synth,
+            patch.object(pipeline_runner, "_synth_tts_subprocess") as isolated,
+        ):
+            duration = pipeline_runner._synth_tts_segment(backend, "测试", Path("out.mp3"), 180)
+
+        self.assertEqual(duration, 1.25)
+        synth.assert_called_once()
+        isolated.assert_not_called()
+
+    def test_audition_files_are_grouped_by_provider(self):
+        self.assertEqual(audition_directory("edge").name, "edge")
+        self.assertEqual(audition_filename("edge", "zh-CN-XiaoxiaoNeural"), "01_zh-CN-XiaoxiaoNeural.mp3")
+        self.assertEqual(audition_filename("voxcpm", "男｜自然情感"), "02_男｜自然情感.mp3")
+
+    def test_legacy_voxcpm_names_map_to_the_new_clear_labels(self):
+        self.assertEqual(normalize_voxcpm_voice("1"), "男｜沉稳磁性")
+        self.assertEqual(normalize_voxcpm_voice("2"), "男｜自然情感")
+        self.assertEqual(normalize_voxcpm_voice("女声2"), "女｜大气情感")
+
+    def test_voxcpm_audition_filename_renames_sync_back_to_voice_picker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audition_dir = Path(tmp) / "TTS试听" / "voxcpm"
+            audition_dir.mkdir(parents=True)
+            (audition_dir / "01_我喜欢的男声.mp3").write_bytes(b"test")
+            with patch.object(tts_backend_module, "ROOT", Path(tmp)):
+                self.assertEqual(voxcpm_voice_choices()[0], "我喜欢的男声")
+                self.assertEqual(voxcpm_voice_display("朗读音频"), "我喜欢的男声")
+                self.assertEqual(normalize_voxcpm_voice("我喜欢的男声"), "男｜沉稳磁性")
+                self.assertEqual(audition_filename("voxcpm", "我喜欢的男声"), "01_我喜欢的男声.mp3")
+
+    def test_voicevox_audition_is_deliberately_skipped(self):
+        with self.assertRaisesRegex(ValueError, "VOICEVOX"):
+            audition_directory("voicevox")
+
+    def test_audition_text_follows_voice_language(self):
+        self.assertIn("こんにちは", audition_text_for_voice("edge", "ja-JP-NanamiNeural"))
+        self.assertIn("你好", audition_text_for_voice("voxcpm", "2"))
 
 
 class LocalSourceSafetyRegressionTests(unittest.TestCase):

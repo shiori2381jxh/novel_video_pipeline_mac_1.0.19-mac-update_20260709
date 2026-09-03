@@ -362,6 +362,8 @@ def probe_tts(provider: str, base_url: str, api_key: str, voice: str, model: str
         return _probe_edge_tts(voice)
     if provider == "voicevox":
         return _probe_voicevox(base_url)
+    if provider == "voxcpm":
+        return _probe_voxcpm(voice, model)
     if provider in {"openai", "custom"}:
         base = _base("openai", base_url, DEFAULT_BASES["openai"])
         if not api_key:
@@ -377,6 +379,52 @@ def probe_tts(provider: str, base_url: str, api_key: str, voice: str, model: str
     if provider == "azure":
         return _probe_azure_tts(api_key)
     return ProbeResult("TTS API", provider, False, message="未知或暂未支持检测的 TTS Provider")
+
+
+def _probe_voxcpm(voice: str, model: str) -> ProbeResult:
+    from app.backends.tts import (
+        VOXCPM_VOICE_BUNDLE,
+        VOXCPM_VOICE_CATALOG,
+        normalize_voxcpm_voice,
+        voxcpm_voice_choices,
+        voxcpm_voice_display,
+    )
+
+    choices = voxcpm_voice_choices()
+
+    missing = []
+    for name, row in VOXCPM_VOICE_CATALOG.items():
+        path = VOXCPM_VOICE_BUNDLE / "favorite_voices" / row["file"]
+        if not path.is_file():
+            missing.append(name)
+    try:
+        import torch
+        import voxcpm
+    except Exception as exc:
+        return ProbeResult(
+            "TTS API",
+            "voxcpm",
+            False,
+            str(VOXCPM_VOICE_BUNDLE),
+            f"收藏音色已下载，但 VoxCPM 运行库尚不可用：{exc}。Windows 请双击 Install_VoxCPM.bat；macOS 请双击 Install_VoxCPM.command。",
+            choices,
+            choices[0] if choices else "",
+        )
+    selected = normalize_voxcpm_voice(voice)
+    ok = bool(VOXCPM_VOICE_CATALOG) and not missing and (not selected or selected in VOXCPM_VOICE_CATALOG)
+    details = [f"torch: {torch.__version__}", f"voxcpm: {getattr(voxcpm, '__version__', 'installed')}"]
+    if missing:
+        details.append(f"缺少参考音频：{'、'.join(missing)}")
+    return ProbeResult(
+        "TTS API",
+        "voxcpm",
+        ok,
+        str(VOXCPM_VOICE_BUNDLE),
+        "VoxCPM2 本地运行库和收藏音色可用；首次合成会自动下载数 GB 模型权重。" if ok else "VoxCPM 配置不完整",
+        choices,
+        voxcpm_voice_display(selected) if selected in VOXCPM_VOICE_CATALOG else (choices[0] if choices else ""),
+        details,
+    )
 
 
 def _probe_edge_tts(voice: str) -> ProbeResult:

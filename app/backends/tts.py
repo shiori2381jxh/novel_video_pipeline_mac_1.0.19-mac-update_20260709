@@ -2,6 +2,7 @@
 支持：
   - edge       (microsoft edge-tts，免费、零配置)
   - voicevox   (本地，HTTP API http://127.0.0.1:50021)
+  - voxcpm     (本地 VoxCPM2，使用收藏参考音色克隆)
   - openai     (OpenAI TTS，需 API key)
   - azure      (Azure Cognitive Services TTS)
   - elevenlabs (ElevenLabs)
@@ -12,9 +13,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import platform
 import subprocess
 import sys
 import tempfile
+import threading
 import wave
 import contextlib
 import re
@@ -23,6 +26,88 @@ from pathlib import Path
 import httpx
 from app.utils.http import http_post
 from app.utils.secrets import clean_api_key
+
+
+ROOT = Path(__file__).resolve().parents[2]
+VOXCPM_VOICE_BUNDLE = ROOT / "vendor" / "voxcpm-favorite-voices"
+VOXCPM_DEFAULT_MODEL = "openbmb/VoxCPM2"
+_VOXCPM_MODEL = None
+_VOXCPM_MODEL_KEY: tuple[str, str, bool] | None = None
+_VOXCPM_MODEL_LOCK = threading.Lock()
+
+
+def _load_voxcpm_voice_catalog() -> dict[str, dict[str, str]]:
+    path = VOXCPM_VOICE_BUNDLE / "favorite_voices.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for name, row in data.items():
+        if not isinstance(row, dict):
+            continue
+        filename = str(row.get("file") or "").strip()
+        if not filename:
+            continue
+        result[str(name)] = {
+            "file": filename,
+            "description": str(row.get("description") or "").strip(),
+        }
+    return result
+
+
+VOXCPM_VOICE_CATALOG = _load_voxcpm_voice_catalog()
+VOXCPM_FAVORITE_VOICES = list(VOXCPM_VOICE_CATALOG)
+VOXCPM_VOICE_ALIASES = {
+    "朗读音频": "男｜沉稳磁性",
+    "1": "男｜沉稳磁性",  # 1.wav 与 朗读音频.wav 完全相同，合并为一个选项。
+    "2": "男｜自然情感",
+    "女1 有点南方口音": "女｜清亮自然",
+    "沉稳女1": "女｜低沉稳重",
+    "女声2": "女｜大气情感",
+}
+
+
+def voxcpm_voice_entries() -> list[tuple[str, str]]:
+    """Return (display name, stable catalog name), honoring audition filenames."""
+    audition_dir = ROOT / "TTS试听" / "voxcpm"
+    entries: list[tuple[str, str]] = []
+    used_labels: set[str] = set()
+    for index, catalog_name in enumerate(VOXCPM_FAVORITE_VOICES, start=1):
+        label = catalog_name
+        matches = sorted(audition_dir.glob(f"{index:02d}_*.mp3"), key=lambda path: path.name.casefold())
+        if matches:
+            candidate = matches[0].stem.split("_", 1)[1].strip()
+            if candidate:
+                label = candidate
+        if label in used_labels:
+            label = f"{label}（{index:02d}）"
+        used_labels.add(label)
+        entries.append((label, catalog_name))
+    return entries
+
+
+def voxcpm_voice_choices() -> list[str]:
+    return [label for label, _catalog_name in voxcpm_voice_entries()]
+
+
+def normalize_voxcpm_voice(value: object) -> str:
+    voice = str(value or "").strip()
+    voice = VOXCPM_VOICE_ALIASES.get(voice, voice)
+    for label, catalog_name in voxcpm_voice_entries():
+        if voice == label:
+            return catalog_name
+    return voice
+
+
+def voxcpm_voice_display(value: object) -> str:
+    catalog_name = normalize_voxcpm_voice(value)
+    for label, stable_name in voxcpm_voice_entries():
+        if catalog_name == stable_name:
+            return label
+    return str(value or "").strip()
 
 
 class TTSBackend:
@@ -157,6 +242,84 @@ class TTSBackend:
         )
         s.raise_for_status()
         out_path.write_bytes(s.content)
+
+    # ── VoxCPM2（本地 Apple Silicon / CPU / CUDA） ───────
+    def _synth_voxcpm(self, text: str, out_path: Path):
+        """Clone one bundled favorite voice with one process-wide model."""
+        selected_voice = normalize_voxcpm_voice(self.voice)
+        preset = VOXCPM_VOICE_CATALOG.get(selected_voice)
+        if preset is None:
+            candidate = Path(str(self.voice or "").strip()).expanduser()
+            if not candidate.is_file():
+                known = "、".join(VOXCPM_FAVORITE_VOICES) or "（未找到收藏音色包）"
+                raise ValueError(f"未知 VoxCPM 音色：{self.voice}。可选：{known}")
+            reference_audio = candidate.resolve()
+            default_control = ""
+        else:
+            reference_audio = (VOXCPM_VOICE_BUNDLE / "favorite_voices" / preset["file"]).resolve()
+            default_control = preset.get("description", "")
+        if not reference_audio.is_file():
+            raise FileNotFoundError(f"VoxCPM 参考音频不存在：{reference_audio}")
+
+        model_id = str(self.extra.get("model") or "").strip()
+        if not model_id or model_id in {"tts-1", "tts-1-hd", "gpt-4o-mini-tts"}:
+            model_id = VOXCPM_DEFAULT_MODEL
+        device = str(self.extra.get("voxcpm_device") or "").strip().lower()
+        if not device:
+            device = "mps" if sys.platform == "darwin" and platform.machine() == "arm64" else "auto"
+        optimize = bool(self.extra.get("voxcpm_optimize", False))
+        control = str(self.extra.get("emotion") or default_control).strip()
+        final_text = f"({control}){text}" if control else str(text)
+        cfg_value = _bounded_extra_float(self.extra, "voxcpm_cfg_value", 2.0, 0.1, 10.0)
+        inference_timesteps = int(_bounded_extra_float(self.extra, "voxcpm_inference_timesteps", 10, 1, 100))
+
+        try:
+            import soundfile as sf
+            from voxcpm import VoxCPM
+        except Exception as exc:
+            raise RuntimeError(
+                "VoxCPM 尚未安装。Windows 请双击 Install_VoxCPM.bat，macOS 请双击 Install_VoxCPM.command，安装完成后重新检测。"
+            ) from exc
+
+        global _VOXCPM_MODEL, _VOXCPM_MODEL_KEY
+        model_key = (model_id, device, optimize)
+        with _VOXCPM_MODEL_LOCK:
+            if _VOXCPM_MODEL is None or _VOXCPM_MODEL_KEY != model_key:
+                _VOXCPM_MODEL = VoxCPM.from_pretrained(
+                    model_id,
+                    load_denoiser=False,
+                    device=device,
+                    optimize=optimize,
+                )
+                _VOXCPM_MODEL_KEY = model_key
+            wav = _VOXCPM_MODEL.generate(
+                text=final_text,
+                reference_wav_path=str(reference_audio),
+                cfg_value=cfg_value,
+                inference_timesteps=inference_timesteps,
+                normalize=bool(self.extra.get("voxcpm_normalize", False)),
+                denoise=False,
+            )
+            sample_rate = int(_VOXCPM_MODEL.tts_model.sample_rate)
+
+        temporary_wav = out_path if out_path.suffix.lower() == ".wav" else out_path.with_suffix(".voxcpm.tmp.wav")
+        temporary_wav.unlink(missing_ok=True)
+        try:
+            sf.write(str(temporary_wav), wav, sample_rate)
+            if temporary_wav != out_path:
+                from app.utils.ffmpeg import ffmpeg_path
+                subprocess.run(
+                    [
+                        ffmpeg_path(), "-y", "-i", str(temporary_wav),
+                        "-c:a", "libmp3lame", "-b:a", "192k", str(out_path),
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        finally:
+            if temporary_wav != out_path:
+                temporary_wav.unlink(missing_ok=True)
 
     # ── OpenAI TTS ───────────────────────────────────────
     def _synth_openai(self, text: str, out_path: Path):
