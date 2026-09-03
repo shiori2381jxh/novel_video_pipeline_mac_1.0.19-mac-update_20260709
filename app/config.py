@@ -599,7 +599,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "dependency_pip_timeout_seconds": 1800,
     "dependency_ffmpeg_url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
     "dependency_last_report": "",
-    "update_manifest_url": "https://github.com/shiori2381jxh/novel_video_pipeline_release/releases/latest/download/latest.json",
+    "update_manifest_url": "https://github.com/shiori2381jxh/novel_video_pipeline_mac_1.0.19-mac-update_20260709/releases/latest/download/latest.json",
     "update_check_on_startup": True,
     "feedback_issue_url": "https://github.com/1951779219/novel_video_pipeline_feedback/issues/new/choose",
 
