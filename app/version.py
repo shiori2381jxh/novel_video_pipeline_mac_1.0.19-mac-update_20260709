@@ -1,3 +1,3 @@
 """Application version used by the update system."""
 
-VERSION = "1.0.33-mac-update"
+VERSION = "1.0.34-windows"

@@ -40,12 +40,16 @@ from app.config import API_KEY_FIELDS
 from app.version import VERSION
 from app.backends.tts import (
     EDGE_MULTI_VOICES,
+    VOXCPM_DEFAULT_MODEL,
     VOICEVOX_FREQUENT_VOICES,
     discover_edge_voices,
     edge_voice_choices,
     preferred_available_edge_voice,
+    voxcpm_voice_choices,
+    voxcpm_voice_display,
 )
 from app.utils.secrets import clean_api_key, redact_secret_text
+from app.tts_audition import AUDITION_ROOT, generate_audition
 
 
 IMPORT_DIR = DATA_DIR / "imports"
@@ -1655,8 +1659,9 @@ class PipelineGUI:
         )
         buttons(("检测读音审校 API", lambda: self._probe_api("pronunciation_dictionary")))
 
+        tts_provider_options = ["edge", "voicevox", "voxcpm", "openai", "azure", "elevenlabs", "custom"]
         subheading("TTS 连接（仅使用 OpenAI / 自定义 TTS 时填写）")
-        combo("TTS Provider", "tts_provider", ["edge", "voicevox", "openai", "azure", "elevenlabs", "custom"], "edge")
+        combo("TTS Provider", "tts_provider", tts_provider_options, "edge")
         relay_station_combo("TTS API 来源（OpenAI 兼容时）", "tts_relay_station")
         row("TTS Base URL/中转", "tts_base_url", "")
         secret_row("TTS API Key", "tts_api_key", "")
@@ -1766,6 +1771,7 @@ class PipelineGUI:
         row("外部 API 并发", "max_concurrent_external_api", "2")
 
         section("TTS")
+        tts_provider_widget = synced_combo("TTS Provider", "tts_provider", tts_provider_options)
         combo("音色（自动检测）", "tts_voice", EDGE_MULTI_VOICES, config.tts_voice)
         tts_voice_widget = self.combo_widgets["tts_voice"]
         tts_voice_widget.configure(postcommand=self._schedule_tts_voice_dropdown_style)
@@ -1789,11 +1795,18 @@ class PipelineGUI:
         self.combo_widgets["tts_provider"].bind(
             "<<ComboboxSelected>>", lambda _event: self._refresh_tts_voice_options(), add="+"
         )
+        tts_provider_widget.bind(
+            "<<ComboboxSelected>>", lambda _event: self._refresh_tts_voice_options(), add="+"
+        )
         self._refresh_tts_voice_options()
         row("语速", "tts_rate", "+0%")
         row("音量倍率", "tts_volume", "1.0")
         section_model_combo("TTS 模型名", "tts_model", "tts-1", ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"])
         row("情感/指令", "tts_emotion", "")
+        buttons(
+            ("生成当前音色试听", self._generate_current_tts_audition),
+            ("打开 TTS 试听文件夹", self._open_tts_audition_dir),
+        )
         row("TTS 重试次数", "tts_retries", "3")
         row("TTS 单段超时秒", "tts_segment_timeout_seconds", "180")
         row("TTS 卡段提示秒", "tts_stall_fallback_seconds", "240")
@@ -2919,6 +2932,74 @@ class PipelineGUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _generate_current_tts_audition(self):
+        """Generate one sample without blocking Tk, grouped by provider."""
+        provider = self._ui_value("tts_provider", "edge").lower()
+        if provider == "voicevox":
+            messagebox.showinfo("VOICEVOX 试听", "VOICEVOX 请直接在 VOICEVOX 软件中试听，本程序不重复生成。")
+            return
+        try:
+            self._apply_config_form(save_profile=False)
+            base_url, api_key = pr._tts_route_settings()
+            voice = _tts_voice_id(self._ui_value("tts_voice"))
+            if not voice:
+                raise ValueError("请先选择或填写音色")
+            args = {
+                "provider": provider,
+                "voice": voice,
+                "rate": self._ui_value("tts_rate", "+0%"),
+                "api_key": api_key,
+                "base_url": base_url,
+                "model": self._ui_value("tts_model", "tts-1"),
+                "emotion": self._ui_value("tts_emotion"),
+                "volume": self._ui_value("tts_volume", "1.0"),
+                "extra": dict(config.get("tts_extra", {}) or {}),
+            }
+        except Exception as exc:
+            messagebox.showerror("无法生成试听", redact_secret_text(exc))
+            return
+
+        self._append_probe_log(f"[TTS试听] 正在生成 provider={provider} voice={voice} ...")
+
+        def worker():
+            try:
+                path, duration = generate_audition(**args)
+            except Exception as exc:
+                self.root.after(
+                    0,
+                    lambda exc=exc: messagebox.showerror("TTS 试听失败", redact_secret_text(exc)),
+                )
+                self.root.after(0, lambda exc=exc: self._append_probe_log(f"[TTS试听] 失败：{redact_secret_text(exc)}"))
+                return
+            self.root.after(0, lambda: self._finish_tts_audition(path, duration))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_tts_audition(self, path: Path, duration: float):
+        self._append_probe_log(f"[TTS试听] 已生成 {path}（{duration:.1f} 秒）")
+        messagebox.showinfo("TTS 试听已生成", f"已保存到：\n{path}\n\n时长：{duration:.1f} 秒")
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            elif sys.platform == "win32":
+                __import__("os").startfile(str(path))
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception:
+            pass
+
+    def _open_tts_audition_dir(self):
+        AUDITION_ROOT.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(AUDITION_ROOT)])
+            elif sys.platform == "win32":
+                __import__("os").startfile(str(AUDITION_ROOT))
+            else:
+                subprocess.Popen(["xdg-open", str(AUDITION_ROOT)])
+        except Exception as exc:
+            messagebox.showerror("打开试听文件夹失败", str(exc))
+
     def _append_probe_log(self, text: str):
         try:
             self.log_text.insert(tk.END, redact_secret_text(text).rstrip() + "\n")
@@ -2937,6 +3018,14 @@ class PipelineGUI:
         if provider == "voicevox":
             choices = VOICEVOX_FREQUENT_VOICES
             self._set_tts_voice_status("VOICEVOX 音色由本地服务提供。", ok=True)
+        elif provider == "voxcpm":
+            choices = voxcpm_voice_choices()
+            current = voxcpm_voice_display(current)
+            model_var = self.vars.get("tts_model")
+            current_model = self._ui_value("tts_model").strip()
+            if model_var is not None and current_model in {"", "tts-1", "tts-1-hd", "gpt-4o-mini-tts"}:
+                model_var.set(VOXCPM_DEFAULT_MODEL)
+            self._set_tts_voice_status("VoxCPM2 收藏音色：本地 MPS 单路生成，首次使用会下载模型。", ok=True)
         elif provider == "edge":
             choices = edge_voice_choices(self._edge_available_voices, current)
             if self._edge_available_voices is None and not self._edge_voice_probe_running:
@@ -3029,6 +3118,8 @@ class PipelineGUI:
 
     def _schedule_tts_voice_dropdown_style(self):
         # ttk populates its internal Listbox only after postcommand returns.
+        if self._ui_value("tts_provider").lower() == "voxcpm":
+            self._refresh_tts_voice_options()
         self.root.after_idle(self._style_tts_voice_dropdown)
 
     def _style_tts_voice_dropdown(self):
@@ -3099,7 +3190,7 @@ class PipelineGUI:
         }.get(kind)
         if kind == "tts" and tts_provider in {"openai", "custom"}:
             target_key = "tts_model"
-        elif kind == "tts" and tts_provider in {"edge", "elevenlabs"}:
+        elif kind == "tts" and tts_provider in {"edge", "elevenlabs", "voxcpm"}:
             target_key = "tts_voice"
         if target_key and result.models:
             widget = self.combo_widgets.get(target_key)

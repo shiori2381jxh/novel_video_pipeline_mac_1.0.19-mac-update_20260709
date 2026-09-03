@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a scrubbed macOS release zip and latest.json for GitHub Releases."""
+"""Build scrubbed macOS or Windows release archives for GitHub Releases."""
 from __future__ import annotations
 
 import argparse
@@ -15,15 +15,28 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
-COPY_FILES = (
+COMMON_COPY_FILES = (
     "AGENTS.md",
-    "Install_Mac_Dependencies.command",
-    "Open_GUI.command",
     "README.md",
     "requirements.txt",
     "update.bat",
 )
-COPY_DIRS = ("app", "docs", "scripts", "prompts")
+PLATFORM_COPY_FILES = {
+    "macos": (
+        "Install_Mac_Dependencies.command",
+        "Install_VoxCPM.command",
+        "Open_GUI.command",
+    ),
+    "windows": (
+        "Install_Windows_Dependencies.bat",
+        "Install_VoxCPM.bat",
+        "Chrome调试模式启动.bat",
+        "Seedance画布.bat",
+        "启动.bat",
+        "桌面GUI.bat",
+    ),
+}
+COPY_DIRS = ("app", "assets", "docs", "scripts", "prompts", "vendor", "TTS试听")
 IGNORE_DIRS = {"__pycache__", ".git", ".venv", "dist"}
 IGNORE_SUFFIXES = {".pyc", ".pyo"}
 IGNORE_FILES = {".DS_Store"}
@@ -71,13 +84,20 @@ def scrub_settings(data: dict) -> dict:
     return cleaned
 
 
-def load_default_settings() -> dict:
+def load_default_settings(target_platform: str = "macos") -> dict:
     import sys
 
     sys.path.insert(0, str(ROOT))
     from app.config import fresh_install_settings
 
-    return scrub_settings(fresh_install_settings())
+    settings = scrub_settings(fresh_install_settings())
+    if target_platform == "windows":
+        settings["update_manifest_url"] = (
+            "https://github.com/shiori2381jxh/"
+            "novel_video_pipeline_mac_1.0.19-mac-update_20260709/"
+            "releases/latest/download/latest-windows.json"
+        )
+    return settings
 
 
 def load_default_profile() -> tuple[str, dict]:
@@ -92,8 +112,8 @@ def load_default_profile() -> tuple[str, dict]:
     return DEFAULT_JAPANESE_PROFILE_NAME, scrub_settings(profile)
 
 
-def copy_source(staging: Path) -> None:
-    for rel in COPY_FILES:
+def copy_source(staging: Path, target_platform: str) -> None:
+    for rel in COMMON_COPY_FILES + PLATFORM_COPY_FILES[target_platform]:
         src = ROOT / rel
         if src.exists():
             copy_file(src, staging / rel)
@@ -114,9 +134,9 @@ def copy_source(staging: Path) -> None:
             copy_file(src, staging / rel / rel_path)
 
 
-def copy_sanitized_data(staging: Path) -> None:
+def copy_sanitized_data(staging: Path, target_platform: str) -> None:
     """Create clean defaults from the designated recipe, never from live credentials."""
-    settings = load_default_settings()
+    settings = load_default_settings(target_platform)
     profile_name, profile = load_default_profile()
 
     settings_dst = staging / "data" / "settings.json"
@@ -126,7 +146,7 @@ def copy_sanitized_data(staging: Path) -> None:
     defaults_dir = staging / "data" / "defaults"
     defaults_dir.mkdir(parents=True, exist_ok=True)
     (defaults_dir / "settings.template.json").write_text(
-        json.dumps(load_default_settings(), ensure_ascii=False, indent=2),
+        json.dumps(load_default_settings(target_platform), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -145,6 +165,7 @@ def chmod_commands(staging: Path) -> None:
     for rel in (
         "Open_GUI.command",
         "Install_Mac_Dependencies.command",
+        "Install_VoxCPM.command",
         "scripts/start_gui_macos.command",
         "scripts/start_chrome_debug_macos.command",
         "scripts/start_seedance_canvas_macos.command",
@@ -176,8 +197,9 @@ def build_asset_url(repo: str, tag: str, zip_name: str, explicit: str = "") -> s
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build scrubbed release package and latest.json.")
+    parser = argparse.ArgumentParser(description="Build a scrubbed Windows or macOS release package.")
     parser.add_argument("--output-dir", default=str(DIST))
+    parser.add_argument("--platform", choices=("macos", "windows"), default="macos")
     parser.add_argument("--repo", default="1951779219/novel_video_pipeline_mac_release", help="GitHub release repo owner/name")
     parser.add_argument("--asset-url", default="", help="Explicit package download URL")
     parser.add_argument("--notes", default="", help="Release notes for latest.json")
@@ -188,10 +210,12 @@ def main() -> int:
     tag = f"v{ver}"
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    package_name = f"novel_video_pipeline_mac_{safe_slug(ver)}_{time.strftime('%Y%m%d')}"
+    platform_slug = "windows" if args.platform == "windows" else "mac"
+    package_name = f"novel_video_pipeline_{platform_slug}_{safe_slug(ver)}_{time.strftime('%Y%m%d')}"
     staging = output_dir / package_name
     zip_path = output_dir / f"{package_name}.zip"
-    latest_path = output_dir / "latest.json"
+    manifest_name = "latest-windows.json" if args.platform == "windows" else "latest.json"
+    latest_path = output_dir / manifest_name
 
     if staging.exists():
         shutil.rmtree(staging)
@@ -199,9 +223,10 @@ def main() -> int:
         zip_path.unlink()
     staging.mkdir(parents=True)
 
-    copy_source(staging)
-    copy_sanitized_data(staging)
-    chmod_commands(staging)
+    copy_source(staging, args.platform)
+    copy_sanitized_data(staging, args.platform)
+    if args.platform == "macos":
+        chmod_commands(staging)
     digest = make_zip(staging, zip_path)
 
     notes = args.notes
@@ -210,7 +235,8 @@ def main() -> int:
         if notes_file.exists():
             notes = notes_file.read_text(encoding="utf-8")
     if not notes:
-        notes = f"Novel Video Pipeline {ver} macOS update."
+        platform_name = "Windows" if args.platform == "windows" else "macOS"
+        notes = f"Novel Video Pipeline {ver} {platform_name} update."
 
     manifest = {
         "version": ver,
@@ -218,6 +244,7 @@ def main() -> int:
         "sha256": digest,
         "notes": notes.strip(),
         "mandatory": False,
+        "platform": args.platform,
     }
     latest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(zip_path)

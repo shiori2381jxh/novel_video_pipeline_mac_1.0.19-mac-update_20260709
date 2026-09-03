@@ -33,6 +33,11 @@ PRONUNCIATION_DICTIONARIES_DIR.mkdir(exist_ok=True)
 SETTINGS_SCHEMA_VERSION = 55
 DEFAULT_YOUTUBE_TITLE_TEMPLATE = "{candidate_title}"
 DEFAULT_YOUTUBE_DESCRIPTION = ""
+RELEASE_REPOSITORY = "shiori2381jxh/novel_video_pipeline_mac_1.0.19-mac-update_20260709"
+DEFAULT_UPDATE_MANIFEST_URL = (
+    f"https://github.com/{RELEASE_REPOSITORY}/releases/latest/download/"
+    + ("latest-windows.json" if os.name == "nt" else "latest.json")
+)
 
 API_KEY_FIELDS = {
     "ai_api_key",
@@ -393,7 +398,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "タイトル、説明、番号、表、箇条書き、Markdown、注釈は一切出力しないでください。"
     ),
     # TTS
-    "tts_provider": "edge",  # edge / voicevox / azure / openai / elevenlabs / custom
+    "tts_provider": "edge",  # edge / voicevox / voxcpm / azure / openai / elevenlabs / custom
     "tts_voice": "ja-JP-NanamiNeural",
     "tts_rate": "+0%",
     "tts_volume": 1.0,
@@ -599,7 +604,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "dependency_pip_timeout_seconds": 1800,
     "dependency_ffmpeg_url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
     "dependency_last_report": "",
-    "update_manifest_url": "https://github.com/shiori2381jxh/novel_video_pipeline_mac_1.0.19-mac-update_20260709/releases/latest/download/latest.json",
+    "update_manifest_url": DEFAULT_UPDATE_MANIFEST_URL,
     "update_check_on_startup": True,
     "feedback_issue_url": "https://github.com/1951779219/novel_video_pipeline_feedback/issues/new/choose",
 

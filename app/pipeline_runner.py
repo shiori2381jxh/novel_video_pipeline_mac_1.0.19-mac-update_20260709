@@ -2923,7 +2923,9 @@ def _synth_tts_subprocess(payload: dict, timeout_seconds: float) -> float:
 
 
 def _synth_tts_segment(tts: TTSBackend, text: str, out_path: Path, segment_timeout_seconds: float) -> float:
-    if bool(config.get("tts_subprocess_isolation", True)):
+    # VoxCPM2 is a 2B local model. Keep it in this pipeline process so every
+    # segment reuses one loaded instance instead of loading several GB again.
+    if str(tts.provider or "").strip().lower() != "voxcpm" and bool(config.get("tts_subprocess_isolation", True)):
         payload = _tts_backend_payload(segment_timeout_seconds, text, out_path)
         return _synth_tts_subprocess(payload, segment_timeout_seconds + 15.0)
     return tts.synth(text, out_path)
@@ -3354,7 +3356,8 @@ def _stage_tts_manifest_impl(
         config.tts_provider,
     )
 
-    workers = _parallel_limit("max_parallel_tts", 2, len(segments), hard_cap=12)
+    provider = str(config.tts_provider or "").strip().lower()
+    workers = 1 if provider == "voxcpm" else _parallel_limit("max_parallel_tts", 2, len(segments), hard_cap=12)
     segment_timeout_seconds = _bounded_timeout(config.get("tts_segment_timeout_seconds", 180), 180.0)
     stall_retry_seconds = _optional_timeout(config.get("tts_stall_fallback_seconds", 240), 240.0, minimum=5.0)
     retry_until_success = bool(config.get("tts_retry_until_success", True))
@@ -3364,6 +3367,8 @@ def _stage_tts_manifest_impl(
         f"timeout={segment_timeout_seconds:.0f}s stall_retry_log={stall_retry_seconds:.0f}s "
         f"retry_until_success={'on' if retry_until_success else 'off'} waveform_check={'on' if config.get('tts_waveform_validation', True) else 'off'}"
     )
+    if provider == "voxcpm":
+        on_log("  VoxCPM2 使用进程内模型缓存和单路 MPS 推理，已忽略 TTS 多并发与子进程隔离设置")
     if dictionary_entries:
         changed_segments = sum(1 for count in replacement_counts if count)
         total_replacements = sum(replacement_counts)

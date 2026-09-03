@@ -1,6 +1,6 @@
 # Agent Maintenance Notes
 
-This project is a macOS-first desktop GUI pipeline for turning novel text into recap videos. Use `Open_GUI.command` as the normal operator entrypoint. The browser upload path is only for YouTube Studio publishing and should not be confused with the retired WebUI flow.
+This project is a Windows/macOS desktop GUI pipeline for turning novel text into recap videos. Use `启动.bat` on Windows or `Open_GUI.command` on macOS as the normal operator entrypoint. The browser upload path is only for YouTube Studio publishing and should not be confused with the retired WebUI flow.
 
 ## Start Here
 

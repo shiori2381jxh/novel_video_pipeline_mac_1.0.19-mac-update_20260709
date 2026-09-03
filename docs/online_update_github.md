@@ -1,6 +1,7 @@
 # GitHub 线上更新发布说明
 
-软件已经内置“软件更新”页。推荐使用公开 release 仓库发布更新包，GUI 从 `latest.json` 检查新版本。
+软件已经内置“软件更新”页。推荐使用公开 release 仓库发布更新包。macOS GUI 从
+`latest.json` 检查更新，Windows GUI 从 `latest-windows.json` 检查更新。
 
 macOS 更新到 1.0.21 及以上后，程序启动时会检测 FFmpeg 的 ASS 字幕能力。仅在缺少 `libass` 时通过 Homebrew 一次性安装并优先使用 `ffmpeg-full`；后续启动检测通过即跳过，不会重复安装。
 
@@ -54,12 +55,23 @@ RELEASE_REPO=1951779219/novel_video_pipeline_mac_release ./scripts/publish_githu
 python3 scripts/build_release_package.py --repo 1951779219/novel_video_pipeline_mac_release
 ```
 
+Windows 包：
+
+```bash
+python3 scripts/build_release_package.py --platform windows --repo OWNER/REPO
+```
+
 输出：
 
 ```text
 dist/novel_video_pipeline_mac_<version>_<date>.zip
 dist/latest.json
 ```
+
+Windows 构建对应输出 `dist/novel_video_pipeline_windows_*.zip` 和
+`dist/latest-windows.json`。如果 macOS 与 Windows 共用一个仓库，每次最新 Release
+应同时携带两份平台清单；暂时没有新版的平台，可以沿用上一版本清单。这样 GitHub 的
+`releases/latest` 切换时不会让另一平台断更。
 
 `latest.json` 结构：
 
