@@ -1,0 +1,171 @@
+# 模块与提示词修改教程
+
+这份文档给操作员和后续维护 agent 使用。目标是回答两个问题：哪些功能模块在哪里改，哪些提示词可以在 GUI 或配置文件里改。
+
+## 入口和保存位置
+
+正常使用入口是项目根目录的 `Open_GUI.command`。GUI 中点击“保存到当前方案”会写入 `data/settings.json`，并同步写入 `data/profiles/配置1.json` 这类方案文件。
+
+配置优先级大致是：
+
+1. 当前 GUI 表单值。
+2. `data/settings.json`。
+3. 当前方案 `data/profiles/*.json`。
+4. `app/config.py` 里的默认值和迁移逻辑。
+
+如果要给其它 Mac 分发默认配置，改 `app/config.py` 和发布包里的脱敏 `data/settings.json`；如果只改本机当前使用习惯，改 GUI 后保存即可。
+
+当前新安装默认使用内置的“日语推文默认配置”。该方案以本机“異世界推文1”为制作配方来源，发布时会移除 API Key、接口地址和中转站信息，并重置浏览器账号、频道方案、定时日期及自动上传开关；在线升级只更新 `data/defaults/` 中的内置模板，不覆盖老用户的 `data/settings.json` 和 `data/profiles/`。
+
+## 模块位置速查
+
+| 功能 | GUI 区域 | 主要文件 | 常见输出 |
+| --- | --- | --- | --- |
+| 小说搜索/采集 | 小说来源、搜索框 | `app/scrapers/`, `app/scrapers/source_catalog.py` | 导入文本、任务目录 |
+| 洗稿/改写 | AI 洗稿 | `app/pipeline_runner.py`, `app/backends/llm.py` | `text_rewritten.txt`, `text_rewrite_report.json` |
+| 分段/节奏 | 视频节奏、批量与上传 | `app/pipeline_runner.py`, `app/stages/stage_pacing.py` | `segments.json`, `plans.json` |
+| TTS | TTS 配置 | `app/backends/tts.py`, `app/tts_worker.py`, `app/pipeline_runner.py` | `audio/*.mp3`, `tts_manifest.json` |
+| 人设分析 | 图片与提示词 | `app/character_analysis.py`, `app/pipeline_runner.py` | `character_profiles.json` |
+| 人设参考图 | 图片与提示词 | `app/backends/image.py`, `app/pipeline_runner.py` | `character_reference_manifest.json` |
+| 剧情图 | 图片与提示词 | `app/backends/image.py`, `app/pipeline_runner.py` | `images/`, `prompts.json` |
+| 封面 | 封面配置 | `app/backends/image.py`, `app/pipeline_runner.py` | `cover/` |
+| 合成视频 | 字幕/视频配置 | `app/stages/stage6_compose.py`, `app/pipeline_runner.py` | `{输入文件名}.mp4`, `subtitle.srt` |
+| Short竖屏视频 | Short 竖屏短视频 | `app/stages/stage6_compose.py`, `app/pipeline_runner.py` | `shorts/short.mp4`, `shorts/prompts.json` |
+| 浏览器上传 | 批量与上传 | `app/upload.py`, `app/vendor/stage5_upload_browser.py` | `upload_result.json` |
+| 依赖检测 | 依赖检测 | `app/dependency_manager.py`, `scripts/setup_macos.sh` | `data/dependency_report.json` |
+
+## GUI 里可修改的主要提示词
+
+这些字段都可以在 GUI 保存，也可以直接在 `data/settings.json` / `data/profiles/*.json` 中修改。
+
+## 统一 AI 接口
+
+GUI 的“API 设置与 Key”区域顶部有一组统一接口字段，并在同一区域集中管理 TTS、分镜、图片、人设图、剧情参考图和封面的 Provider、Base URL、API Key 与模型：
+
+- `ai_api_enabled`：开启后，文本生成和 OpenAI 兼容生图默认共用统一接口。
+- `ai_api_base_url`：统一 Base URL/中转地址，例如 `https://你的中转站/v1`。
+- `ai_api_key`：统一 API Key，只需要填一次。
+- `ai_api_text_model`：洗稿、标题/概梗候选、人设分析、分镜提示词、封面分析使用的文本模型。
+- `ai_api_image_model`：剧情图、封面、人设图、剧情参考图使用的图片模型。
+
+GUI 中所有 API Key 默认用黑点遮挡；可通过输入框右侧的小眼睛临时显示/隐藏，或点击“复制”直接复制完整 Key。
+
+模块自己的 `llm_base_url` / `llm_api_key` / `image_base_url` / `image_api_key` 等字段仍保留，用于高级覆盖或本地服务。普通分包机建议只填统一接口，图片 Provider 选择 `openai` 或 `custom`，封面/人设/剧情参考保持 `same_as_image` 即可。
+
+### 中转站库：文本和图片使用不同中转站
+
+如果有多个中转站，在 GUI 的“API 设置与 Key → 中转站库”中设置数量（最多 6 个），然后为每个编号填写一次 URL 与 API Key。随后在“图片与提示词”中分别选择：
+
+- `文本使用中转站`：洗稿、标题、人设分析、分镜提示词等文本调用使用的编号。
+- `图片使用中转站`：剧情图，以及设为 `same_as_image` 的封面、人设图、剧情参考图使用的编号。
+
+选择“手动填写（旧设置）”则完全沿用原有的模块 Base URL/API Key 字段。已保存的旧配置无需迁移；中转站库为空时也不会改变原有调用。中转站选择优先于统一 API 的 URL/Key，因此可在保留统一模型名设置的同时，让文本和图片走不同的中转站。
+
+各业务分组仍保留对应的模型输入框。如果它与“API 设置与 Key”里的同名模型填写不同，保存配置时 GUI 会要求选择最终使用的模型，然后同步两处。
+
+## OpenAI / gpt-image-2 是否需要 workflow
+
+不需要。`gpt-image-1`、`gpt-image-2`、DALL-E 或其它 OpenAI 兼容图片接口，运行时会直接把最终提示词发给图片接口生成：
+
+- 人设图使用人设分析得到的角色提示词 + `character_reference_prompt_suffix`。
+- 剧情图使用通用前缀、段落分析提示词、人设锁和视觉主题。
+- 剧情参考图如果有参考图，会走 OpenAI 兼容图片编辑接口；没有参考图则走普通提示词生图。
+- 标题阶段用 `marketing_candidates_prompt` 从开头、中段、结尾生成 3 个标题、2 个概梗和内容标签，但不生成 `【朗読・小説】` 前缀；封面再把全部候选经过 `cover_prompt_template` / `cover_ai_analysis_prompt` 和 GUI 中可编辑的 `cover_poster_method_prompt` 生成一条成品提示词。程序不会再偷偷加载另一份固定封面方法。
+
+GUI 里的 `人设图 workflow(仅 ComfyUI)`、`剧情参考 workflow(仅 ComfyUI)` 和全局 `image_workflow` 只给 ComfyUI 使用。Provider 选择 `openai` / `custom` / `same_as_image` 时，不需要填写 workflow；只要统一接口或模块自己的 Base URL、API Key、模型名正确即可。
+
+| 字段 | 用途 | 可用变量 |
+| --- | --- | --- |
+| `ai_rewrite_prompt` | 洗稿/改写文章，替代旧的“扫文清理”逻辑 | `{text}` 由代码分批传入 |
+| `marketing_candidates_prompt` | 生成3个标题、2个概梗和内容标签，不含 `【朗読・小説】` | 开头、中段、结尾抽样与全篇简报 |
+| `character_analysis_prompt` | 分析主角、配角、人设、视觉主题 | 原文或截断后的文章内容 |
+| `character_reference_prompt_suffix` | 生成人设参考图时追加的风格限制 | 人设 JSON 中的角色字段 |
+| `llm_image_prompt_prefix` | 每张剧情图的通用前缀 | 会拼到剧情图提示词前 |
+| `llm_storyboard_prompt` | 剧情图 AI 分析的系统提示词 | 控制分镜图分析规则 |
+| `llm_storyboard_user_template` | 剧情图 AI 分析的用户模板 | `{prefix}`, `{style}`, `{index}`, `{text}` |
+| `short_video_script_prompt` | 独立制作Short时重写45–58秒旁白 | 小说开头、中段、结尾的平衡采样 |
+| `short_video_prebuild_script_enabled` | 在标题/概梗的同一次模型请求中预生成Short文案 | 开关，无模板变量 |
+| `short_video_script_max_chars` | 标题阶段预生成Short文案的最大字数，默认350 | 数字上限 |
+| `short_video_image_prompt` | 选择“重写Short专用提示词”时生成竖屏分镜提示词 | Short旁白、人物与画风锁定 |
+| `short_video_portrait_suffix` | 只追加到重写得到的Short插图提示词 | 固定9:16竖屏构图要求 |
+| `cover_prompt_template` | 封面生成的题材模板 | `{title}`, `{excerpt}`, `{titles}`, `{synopses}`, `{style}`, `{custom}` |
+| `cover_custom_prompt` | 封面模板里的自定义方向 | 由 `{custom}` 引用 |
+| `cover_ai_analysis_prompt` | 封面题材 AI 分析模板 | 全部标题和概梗 |
+| `cover_poster_method_prompt` | 封面的完整制作方法，可在 GUI 直接编辑 | 不再叠加隐藏文件 |
+| `youtube_title_template` | YouTube 上传标题模板；模板优先，剩余字数才补生成标签 | `{candidate_title}`, `{short_title}`, `{clean_title}`, `{title}`, `{intro}`, `{author}`, `{tags}`, `{job_id}` |
+| `youtube_description` | YouTube 上传说明模板 | 同上传标题上下文 |
+| `browser_ad_suitability_template` | YouTube 广告分级问卷选择模板 | JSON，见上传文档 |
+
+## 封面提示词怎么改
+
+封面不是把标题作为后期文本盖到图片上，而是先用全部标题和概梗策划一条封面提示词，再让图片模型生成主体视觉和分层日语文字。推荐改法：
+
+1. 在 GUI 的封面区域修改 `cover_prompt_template`。
+2. 优先保留 `{titles}` 和 `{synopses}`，让模型比较全部发布候选；旧模板仍可使用 `{title}` 和 `{excerpt}`。
+3. 在 GUI 的“封面完整方法（可编辑）”中统一管理事件画面、主标题、强调词、副标题、拟声词、文字颜色、描边以及三国专用排版；这就是运行时使用的完整方法。
+4. 用 `{custom}` 承接题材画风，比如“少女漫画恋爱”“异世界觉醒”“三国权谋”。
+5. 保存配置后，可直接使用 GUI 的“重新生成封面”。旧任务若缺少新候选文件，程序会先补生成 3 个标题和 2 个概梗，再制作封面。
+
+图片接口返回的原始文件会保存在 `cover/cover_provider_raw.png`。封面提示词只要求真正的横向16:9构图，不写固定像素尺寸，也不描述任何比例转换或中央裁切方案；标准化结果保存在 `cover/cover_raw.png`，实际尺寸取GUI的封面宽高设置。
+
+示例可看 `docs/tweet_prompt_templates.md`。
+
+## 剧情图提示词怎么改
+
+### 视频生图解决方案1（高光点选图）
+
+开启“智能选择旁白高光点（不增加图片数）”后，`pacing_seconds_per_image` 只决定图片预算。例如总旁白 1800 秒、每图 300 秒，仍生成约 6 张图。程序先生成 `story_visual_context.json`，再从每个预算窗口的带编号旁白段中选择 1～3 个连续段作为唯一高光事件。全篇背景只能约束时代、世界观和关系，不能向当前画面添加旁白高光中没有的人物或事件。
+
+开启“按高光旁白调整换图时间”后，程序会在图片总数不变、视频总时长不变的前提下，把相邻图片的切换点调整到两个高光时间的中间。最终选择结果记录在 `prompts.json` 和 `plans.json` 的 `highlight_*` 字段中。
+
+旧任务已有图片时仍会复用缓存。要让旧任务应用本方案，需要先在任务队列点击“清除图片缓存”再重新运行。
+
+剧情图由两层组成：
+
+1. `llm_image_prompt_prefix`：每张图都会带上的通用前缀，比如画风、角色年龄、无文字、构图要求。
+2. `llm_storyboard_user_template`：把当前小说段落变成单张分镜图提示词的任务模板。
+
+如果打开了人设分析，`character_profiles.json` 中的 `visual_theme` 和 `characters[].visual_prompt_en` 会继续注入剧情图，避免主角每张图长得不一样。
+
+修改建议：
+
+- 只想改整体画风，优先改 `llm_image_prompt_prefix`。
+- 想改 AI 如何理解段落，改 `llm_storyboard_prompt` 和 `llm_storyboard_user_template`。
+- 想固定主角外貌，改 `character_analysis_prompt` 或重新生成 `character_profiles.json`。
+- 改完提示词后清理旧图片缓存，否则可能复用旧图。
+
+## 洗稿提示词怎么改
+
+GUI 里显示为“AI 洗稿改写”。对应配置：
+
+- `ai_rewrite_enabled`：是否启用。
+- `ai_rewrite_batch_chars`：每批处理字符数。
+- `ai_rewrite_prompt`：洗稿系统提示词。
+
+开启后，洗稿发生在切片和 TTS 前。程序按批次请求文字模型，通过后写入 `text_rewritten.txt` 与 `text_rewrite_report.json`；接口不可用或请求失败时保留原文。
+
+TTS 朗读净化由独立开关控制，可在洗稿关闭时单独执行并写入 `text_tts_ready.txt`。Edge 会处理容易读成“ダッシュ”的连续破折号并统一装饰标点；VOICEVOX 不删除或改写正常日文标点和原始换行，只清理明确的技术性垃圾字符。
+
+## 修改后的验证方法
+
+修改配置或提示词后推荐检查：
+
+```bash
+python3 -m py_compile app/config.py app/gui.py app/pipeline_runner.py
+python3 -m compileall app
+```
+
+然后用 GUI 新建一个短文本任务，至少确认：
+
+- `prompts.json` 里出现新提示词或新前缀。
+- `character_profiles.json` 里人设输出合理。
+- `cover/` 里的封面是新风格。
+- 与输入文件同名的 `.mp4` 能生成。
+
+## 常见问题
+
+如果改了提示词但图没变，多半是缓存命中。清理任务媒体缓存后重跑。
+
+如果提示词里变量没有替换，检查花括号拼写是否和上面的变量表一致。
+
+如果 AI 输出过短，检查对应的 token 上限，例如 `character_analysis_max_tokens`，以及后端模型是否限制输出长度。

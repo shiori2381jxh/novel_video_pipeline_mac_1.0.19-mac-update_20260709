@@ -1,0 +1,41 @@
+# macOS and editor metadata
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# User settings, profiles, projects, generated media, and browser sessions
+data/*
+!data/defaults/
+!data/defaults/**
+
+# Local build, update, backup, and release artifacts
+dist/
+clone_build/
+.rollback/
+build/
+*.log
+
+# Local agent metadata
+.agents/
+.codex/
+
+# Machine-specific helper state
+tools/srt_audio_video_tool/project_path.txt
