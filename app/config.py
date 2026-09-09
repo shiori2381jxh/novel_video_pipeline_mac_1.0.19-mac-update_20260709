@@ -30,7 +30,7 @@ DEFAULTS_DIR.mkdir(exist_ok=True)
 PRONUNCIATION_DICTIONARIES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 55
+SETTINGS_SCHEMA_VERSION = 58
 DEFAULT_YOUTUBE_TITLE_TEMPLATE = "{candidate_title}"
 DEFAULT_YOUTUBE_DESCRIPTION = ""
 RELEASE_REPOSITORY = "shiori2381jxh/novel_video_pipeline_mac_1.0.19-mac-update_20260709"
@@ -146,6 +146,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "scraper_site": "qingtian",
     "scraper_max_chars": 0,
     "scraper_chapter_limit": 0,
+    "longform_default_min_final_chars": 22000,
+    "longform_default_max_final_chars": 88000,
+    "longform_default_batch_episode_count": 5,
     "source_base_url": "https://v1.gyks.cf",
     "source_platform": "番茄",
     "source_media": "小说",
@@ -359,7 +362,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "\"tags\":[\"#タグ1\",\"#タグ2\",\"#タグ3\"]}"
     ),
     "ai_rewrite_enabled": False,
+    # Opt-in task-local proper-noun localization.  It never changes language
+    # and never persists a name map beyond one job directory.
+    "ai_rewrite_proper_noun_localization_enabled": False,
     "ai_rewrite_batch_chars": 3500,
+    "ai_rewrite_min_length_ratio": 0.75,
+    "ai_rewrite_max_length_ratio": 1.35,
     "ai_rewrite_prompt": (
         "你是小说推文视频的洗稿改写编辑。"
         "请把输入的小说正文改写成适合中文/日文推文长视频旁白的版本："
@@ -523,6 +531,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "video_encoder_quality": 20,
     "video_subtitle": True,
     "video_external_subtitle": True,
+    "video_subtitle_traditional": False,
     "video_subtitle_font": "Microsoft YaHei",
     "video_subtitle_size": 48,
     "video_subtitle_position": "下边",
@@ -1008,6 +1017,35 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
             data.setdefault(key, DEFAULT_SETTINGS[key])
     if saved_version < 55:
         data.setdefault("tts_pronunciation_dictionary_scope", "profile")
+    if saved_version < 56:
+        for key in (
+            "ai_rewrite_proper_noun_localization_enabled",
+            "ai_rewrite_min_length_ratio",
+            "ai_rewrite_max_length_ratio",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
+    if saved_version < 57:
+        for key in (
+            "longform_default_min_minutes",
+            "longform_default_max_minutes",
+            "longform_default_batch_episode_count",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
+    if saved_version < 58:
+        # Longform episodes now target the actual narration length.  Retain
+        # user intent from the former minute-based controls at 22k chars/hour.
+        data.setdefault(
+            "longform_default_min_final_chars",
+            max(1, int(data.get("longform_default_min_minutes") or 1)) * 22_000,
+        )
+        data.setdefault(
+            "longform_default_max_final_chars",
+            max(1, int(data.get("longform_default_max_minutes") or 1)) * 22_000,
+        )
+        data["longform_default_max_final_chars"] = max(
+            int(data["longform_default_min_final_chars"]),
+            int(data["longform_default_max_final_chars"]),
+        )
     if saved_version < 23:
         for key in (
             "marketing_title_min_chars",

@@ -32,6 +32,10 @@ clone_build/
 .rollback/
 build/
 *.log
+runtime/
+
+# Machine-specific Windows configuration import bundle
+personal_config_windows_20260903/
 
 # Local agent metadata
 .agents/

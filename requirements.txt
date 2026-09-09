@@ -17,3 +17,4 @@ pyautogui>=0.9.54
 
 # 其他
 pydantic>=2.0.0
+opencc-python-reimplemented>=0.1.7

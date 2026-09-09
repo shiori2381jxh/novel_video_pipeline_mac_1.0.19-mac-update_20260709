@@ -3979,20 +3979,20 @@ def _is_port_open(port: int) -> bool:
 
 def _select_file_via_dialog(page, video_path: Path, on_log: Callable, timeout: int):
     """
-    macOS/Linux 直接用 Playwright file chooser 设置本地路径。
-    Windows 保留原生文件对话框注入逻辑，兼容原先的大文件流程。
+    优先用 Playwright file chooser 设置本地路径。
+    Windows 在浏览器路径失败时才回退到原生文件对话框注入。
     失败时返回 False，由上层决定是否重试整个上传流程。
     """
     video_path = Path(video_path).expanduser().resolve()
     if not video_path.exists():
         on_log(f"  ✗ 视频文件不存在: {video_path}")
         return False
-    if os.name != "nt":
-        return _select_file_with_playwright(page, video_path, on_log, timeout)
-    import ctypes
-    import ctypes.wintypes
-
-    return _try_select_file_once(page, video_path, on_log, timeout)
+    if _select_file_with_playwright(page, video_path, on_log, timeout):
+        return True
+    if os.name == "nt":
+        on_log("  ⚠️ 浏览器文件输入设置失败，改用 Windows 文件选择窗口...")
+        return _try_select_file_once(page, video_path, on_log, timeout)
+    return False
 
 
 def _close_stale_file_dialogs():

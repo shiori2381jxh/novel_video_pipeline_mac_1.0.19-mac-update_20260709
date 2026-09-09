@@ -23,7 +23,7 @@ import unicodedata
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -73,6 +73,19 @@ from app.storyboard_highlights import (
 )
 from app.utils.ffmpeg import ffmpeg_path
 from app.utils.secrets import clean_api_key, redact_secret_text
+from app.rewrite_localization import (
+    Replacement,
+    RewriteBatchResult,
+    RewriteLanguage,
+    apply_replacements,
+    build_deterministic_fallback_replacements,
+    build_structured_rewrite_prompt,
+    detect_rewrite_language,
+    find_residual_sources,
+    extract_rejected_replacement_sources,
+    parse_structured_rewrite_response,
+    validate_rewrite_quality,
+)
 
 
 LogFn = Callable[[str], None]
@@ -82,9 +95,22 @@ IMAGE_SELECTION_FILE = "image_selection.json"
 TTS_REDO_REUSE_IMAGES_FILE = "tts_redo_reuse_images.json"
 SETTINGS_SNAPSHOT_FILE = "settings_snapshot.json"
 ACCELERATION_PREFETCH_REPORT = "acceleration_prefetch.json"
+REWRITE_REPLACEMENTS_FILE = "text_rewrite_replacements.json"
+REWRITE_CHECKPOINT_FILE = "text_rewrite_checkpoint.json"
 SOURCE_INPUT_SNAPSHOT_DIR = "_source_input"
 PRELIMINARY_JOB_PREFIX = "预备分_"
 PRELIMINARY_JOBS_DIR = DATA_DIR / "预备分"
+PRELIMINARY_PACKAGE_MANIFEST = "preliminary_package.json"
+PRELIMINARY_PACKAGE_VERSION = 1
+
+
+@dataclass
+class RewriteRunResult:
+    text: str
+    replacements: list[Replacement]
+    warnings: list[str]
+    language: RewriteLanguage
+    batches: list[dict]
 
 
 class ImageGenerationFailed(RuntimeError):
@@ -797,11 +823,59 @@ def delete_job(job_id: str, *, stop_running: bool = False) -> bool:
     return True
 
 
+def _ignore_mp4_files(_directory: str, names: list[str]) -> set[str]:
+    return {name for name in names if Path(name).suffix.lower() == ".mp4"}
+
+
+def _copy_preliminary_asset(source: Path, destination: Path) -> None:
+    """Stage an asset while recursively excluding MP4 files."""
+    if source.is_dir() and not source.is_symlink():
+        shutil.copytree(source, destination, ignore=_ignore_mp4_files)
+    elif source.suffix.lower() != ".mp4":
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination, follow_symlinks=False)
+
+
+def _preliminary_source_text_path(package_dir: Path) -> Path:
+    source_dir = package_dir / SOURCE_INPUT_SNAPSHOT_DIR
+    candidates = sorted(path for path in source_dir.rglob("*.txt") if path.is_file()) if source_dir.is_dir() else []
+    if not candidates:
+        raise FileNotFoundError("预备分包缺少可重新导入的 TXT 原文")
+    return candidates[0]
+
+
+def _resolve_preliminary_package_path(package_dir: Path, value: object, suffix: str) -> Path:
+    relative = Path(str(value or ""))
+    if not str(value or "") or relative.is_absolute() or relative.suffix.lower() != suffix:
+        raise ValueError("预备分包标记中的文件路径无效")
+    resolved = (package_dir / relative).resolve()
+    if package_dir not in resolved.parents or not resolved.is_file():
+        raise ValueError("预备分包标记中的文件路径无效")
+    return resolved
+
+
+def read_preliminary_package(package_dir: str | Path) -> dict:
+    """Validate a preliminary package and return the inputs for a fresh job."""
+    root = Path(package_dir).expanduser().resolve()
+    manifest = _read_json(root / PRELIMINARY_PACKAGE_MANIFEST, {})
+    if not root.is_dir() or int(manifest.get("version") or 0) != PRELIMINARY_PACKAGE_VERSION:
+        raise ValueError("不是可重新导入的预备分包")
+    text_path = _resolve_preliminary_package_path(root, manifest.get("text_path"), ".txt")
+    audio_path = _resolve_preliminary_package_path(root, manifest.get("audio_path"), ".mp3")
+    inspect_imported_audio(audio_path)
+    return {
+        "package_dir": root,
+        "text_path": text_path,
+        "audio_path": audio_path,
+        "title": str(manifest.get("title") or text_path.stem),
+    }
+
+
 def prepare_job_for_preliminary_scoring(job_id: str) -> str:
     """Keep only delivery assets and rename a finished job for preliminary scoring.
 
     This is intentionally destructive: the retained folder is a compact
-    hand-off package, not a resumable pipeline job.  Moving the retained files
+    hand-off package, not a resumable pipeline job.  Copying the retained files
     into a sibling staging directory first prevents a partly-deleted job when
     an individual file operation fails.
     """
@@ -821,49 +895,42 @@ def prepare_job_for_preliminary_scoring(job_id: str) -> str:
 
     status = load_status(job_id, include_worker=False)
     project_id = str(status.get("project_id") or "")
-    video_path = video_output_path(path)
-    # Older jobs can use final.mp4, while newer jobs use a title-based name.
-    # Keep exactly one completed video: prefer the current configured output.
-    if not video_path.exists() and (path / "final.mp4").exists():
-        video_path = path / "final.mp4"
     keep_names = [
         SOURCE_INPUT_SNAPSHOT_DIR,
         "audio_full.mp3",
         "cover",
         "images",
-        # This includes the Short MP4 and its own audio_full.mp3.
         "shorts",
     ]
-    if video_path.exists() and video_path.parent == path:
-        keep_names.append(video_path.name)
 
     staged = JOBS_DIR / f".{job_id}.preliminary-staging-{secrets.token_hex(8)}"
-    moved: list[str] = []
     try:
         staged.mkdir()
         for name in keep_names:
             source = path / name
             if source.exists() or source.is_symlink():
-                shutil.move(str(source), str(staged / name))
-                moved.append(name)
+                _copy_preliminary_asset(source, staged / name)
+        source_text = _preliminary_source_text_path(staged)
+        audio_full = staged / "audio_full.mp3"
+        if not audio_full.is_file():
+            raise FileNotFoundError("预备分包缺少正片 audio_full.mp3，无法重新导入")
+        _write_json(
+            staged / PRELIMINARY_PACKAGE_MANIFEST,
+            {
+                "version": PRELIMINARY_PACKAGE_VERSION,
+                "text_path": str(source_text.relative_to(staged)),
+                "audio_path": "audio_full.mp3",
+                "title": str(status.get("title") or source_text.stem),
+            },
+        )
         shutil.rmtree(path)
         target_root.mkdir(parents=True, exist_ok=True)
         staged.rename(target)
     except Exception:
-        # Before the source directory is deleted, return retained files to it
-        # so the operator can retry without losing the working task.
-        if path.exists() and staged.exists():
-            for name in moved:
-                source = staged / name
-                if source.exists() or source.is_symlink():
-                    try:
-                        shutil.move(str(source), str(path / name))
-                    except Exception:
-                        pass
-            try:
-                staged.rmdir()
-            except OSError:
-                pass
+        # Assets are copied, not moved, until the source task is deleted.
+        # A staging failure therefore leaves the resumable source untouched.
+        if staged.exists():
+            shutil.rmtree(staged, ignore_errors=True)
         raise
 
     if project_id:
@@ -947,7 +1014,8 @@ def reset_full_job(job_id: str) -> dict:
         # it with fresh candidates when it completes successfully.
         "upload_title_selection.json", "performance.json", "result.json", "upload_result.json",
         ACCELERATION_PREFETCH_REPORT,
-        "text_rewritten.txt", "text_rewrite_report.json", "text_tts_ready.txt",
+        "text_rewritten.txt", "text_rewrite_report.json", REWRITE_REPLACEMENTS_FILE,
+        REWRITE_CHECKPOINT_FILE, "text_tts_ready.txt",
         "segments.json", "durations.json", "plans.json", "plans_prefetch.json", "prompts.json",
         "story_visual_context.json", "character_profiles.json", "character_reference_manifest.json",
         "tts_auto_pronunciation_dictionary.txt", "tts_auto_pronunciation_report.json",
@@ -1007,7 +1075,7 @@ def start_worker(
     # Freeze settings before either launching or queueing. A later GUI profile
     # switch must not change the queued job's prompts, routes, or TTS settings.
     settings_snapshot = job_dir / SETTINGS_SNAPSHOT_FILE
-    if not settings_snapshot.exists():
+    if compose_only or not settings_snapshot.exists():
         _write_settings_snapshot(job_dir, config.as_dict())
 
     max_jobs = max(1, int(config.get("max_concurrent_jobs", 2)))
@@ -1123,10 +1191,94 @@ def apply_profile_to_jobs(job_ids: Iterable[str], profile_name: str) -> tuple[st
         job_dir = job_dir_for(job_id)
         if not job_dir.exists():
             raise FileNotFoundError(f"任务不存在：{job_id}")
+        previous = _read_json(job_dir / SETTINGS_SNAPSHOT_FILE, {})
+        rewrite_keys = {
+            "ai_rewrite_enabled", "ai_rewrite_proper_noun_localization_enabled",
+            "ai_rewrite_batch_chars", "ai_rewrite_min_length_ratio",
+            "ai_rewrite_max_length_ratio", "ai_rewrite_prompt",
+        }
+        if any(previous.get(key) != settings.get(key) for key in rewrite_keys):
+            for name in (
+                "text_rewritten.txt", "text_rewrite_report.json", REWRITE_REPLACEMENTS_FILE,
+                REWRITE_CHECKPOINT_FILE, "text_tts_ready.txt", "segments.json",
+                "durations.json", "plans.json", "plans_prefetch.json", "prompts.json",
+                "audio_full.mp3", "subtitle.ass", "subtitle.srt", "compose_manifest.json",
+            ):
+                (job_dir / name).unlink(missing_ok=True)
+            audio_dir = job_dir / "audio"
+            if audio_dir.exists() and not (job_dir / IMPORTED_AUDIO_MANIFEST).exists():
+                shutil.rmtree(audio_dir)
+            _clear_downstream_after_tts_change(job_dir)
+            append_log(job_dir, "profile change invalidated rewrite/text/TTS caches; next start resumes from cleanup")
         _write_settings_snapshot(job_dir, settings)
         write_status(job_dir, assigned_profile=cleaned)
         append_log(job_dir, f"assigned configuration profile: {cleaned}")
     return cleaned, len(targets)
+
+
+def select_next_queued_job(rows: list[dict], *, exclude_job_id: str | None = None) -> str | None:
+    """Choose an eligible queued job without allowing a longform batch to interleave."""
+    eligible = {"queued", "stopped", "preprocessed"}
+    grouped: dict[tuple[str, str], tuple[dict, dict]] = {}
+    ordinary: list[dict] = []
+    for row in rows:
+        job_id = str(row.get("job_id") or "")
+        if not job_id or job_id == exclude_job_id:
+            continue
+        status = row.get("_status") if isinstance(row.get("_status"), dict) else load_status(job_id)
+        if status.get("project_id") and status.get("longform_batch_id"):
+            grouped.setdefault((str(status["project_id"]), str(status["longform_batch_id"])), (row, status))
+        elif str(row.get("stage") or "") in eligible and not status.get("worker_alive"):
+            ordinary.append(row)
+    active_batches: list[tuple[str, dict]] = []
+    for (project_id, batch_id), (_row, _status) in grouped.items():
+        project = projects.load_project(project_id)
+        for batch in (project.get("longform") or {}).get("batches") or []:
+            if str(batch.get("batch_id") or "") != batch_id:
+                continue
+            if str(batch.get("state") or "") not in {"queued", "running"}:
+                continue
+            active_batches.append((project_id, batch))
+    if active_batches:
+        # A group has one checkout lane: while its current member runs, no
+        # later member and no unrelated task may enter the global queue.
+        active_batches.sort(key=lambda item: str(item[1].get("created_at") or ""))
+        _project_id, batch = active_batches[0]
+        members = sorted(batch.get("members") or [], key=lambda item: int(item.get("order") or 0))
+        first = next((item for item in members if str(item.get("state") or "") != "completed"), None)
+        if not first:
+            return None
+        first_job_id = str(first.get("job_id") or "")
+        row = next((item for item in rows if str(item.get("job_id") or "") == first_job_id), None)
+        if row is None:
+            return None
+        status = row.get("_status") if isinstance(row.get("_status"), dict) else load_status(first_job_id)
+        if (
+            first_job_id
+            and first_job_id != exclude_job_id
+            and str(row.get("stage") or "") in eligible
+            and not status.get("worker_alive")
+        ):
+            return first_job_id
+        return None
+    return str(ordinary[0]["job_id"]) if ordinary else None
+
+
+def pause_longform_batch_for_job(job_id: str, error: str) -> None:
+    """Pause a grouped run after a member fails, without affecting normal jobs."""
+    status = load_status(job_id)
+    project_id = str(status.get("project_id") or "")
+    batch_id = str(status.get("longform_batch_id") or "")
+    if project_id and batch_id:
+        projects.pause_longform_batch(project_id, batch_id, job_id, error)
+
+
+def complete_longform_batch_member_for_job(job_id: str) -> None:
+    status = load_status(job_id)
+    project_id = str(status.get("project_id") or "")
+    batch_id = str(status.get("longform_batch_id") or "")
+    if project_id and batch_id:
+        projects.complete_longform_member(project_id, batch_id, job_id)
 
 
 def start_next_queued_job(*, exclude_job_id: str | None = None, on_log: LogFn = _noop) -> tuple[str, int] | None:
@@ -1136,10 +1288,12 @@ def start_next_queued_job(*, exclude_job_id: str | None = None, on_log: LogFn = 
         return None
     rows = list_jobs(limit=500)
     rows.sort(key=lambda row: 0 if str(row.get("stage") or "") == "preprocessed" else 1)
-    for row in rows:
-        job_id = str(row.get("job_id") or "")
-        if not job_id or job_id == exclude_job_id:
-            continue
+    while rows:
+        job_id = select_next_queued_job(rows, exclude_job_id=exclude_job_id)
+        if not job_id:
+            return None
+        row = next(item for item in rows if str(item.get("job_id") or "") == job_id)
+        rows.remove(row)
         st = load_status(job_id)
         if st.get("worker_alive") or st.get("stage") not in {"queued", "stopped", "preprocessed"}:
             continue
@@ -1172,6 +1326,149 @@ def start_next_queued_job(*, exclude_job_id: str | None = None, on_log: LogFn = 
             on_log(f"  WARN auto-start waiting job {job_id} failed: {safe_error}")
             continue
     return None
+
+
+def create_longform_jobs_from_episodes(project_id: str, batch: dict, episodes: list[dict], title: str) -> list[str]:
+    """Materialize planned text ranges as normal queued jobs without media work."""
+    batch_id = str(batch.get("batch_id") or "")
+    if not batch_id or len(episodes) != len(batch.get("members") or []):
+        raise ValueError("长篇任务组数据不完整")
+    project = projects.load_project(project_id)
+    source_dir = projects.project_dir(project_id) / "longform_sources" / batch_id
+    source_dir.mkdir(parents=True, exist_ok=True)
+    existing = [int(load_status(j, include_worker=False).get("project_episode") or 0) for j in project.get("jobs") or []]
+    base_episode = max(existing, default=0)
+    job_ids: list[str] = []
+    for member, episode in zip(batch["members"], episodes):
+        order = int(member["order"])
+        chapters = episode.get("chapters") or []
+        text = "\n\n".join(f"{chapter.title}\n{chapter.text}" for chapter in chapters).strip()
+        if not text:
+            raise ValueError(f"第{order}集正文为空")
+        source_path = source_dir / f"{order:03d}.txt"
+        source_path.write_text(text, encoding="utf-8")
+        job_id = new_named_job_id(safe_job_name(f"{title}_{base_episode + order:03d}", fallback="episode"))
+        path = job_dir_for(job_id)
+        settings_snapshot = batch.get("settings_snapshot") if isinstance(batch.get("settings_snapshot"), dict) else {}
+        write_status(
+            path,
+            job_id=job_id,
+            title=f"{title} 第{base_episode + order}集",
+            input=str(source_path),
+            source_path=str(source_path),
+            stage="queued",
+            progress=0.0,
+            longform_batch_id=batch_id,
+            longform_batch_order=order,
+            longform_name_memory_enabled=bool(settings_snapshot.get("project_name_memory_enabled", False)),
+            longform_character_lock_enabled=bool(settings_snapshot.get("project_character_lock_enabled", False)),
+            longform_rewrite_replacement_categories=list(settings_snapshot.get("rewrite_replacement_categories") or ["人名"]),
+        )
+        assign_job_to_project(job_id, project_id, episode=base_episode + order, source_path=str(source_path))
+        job_ids.append(job_id)
+    projects.attach_longform_batch_jobs(project_id, batch_id, job_ids)
+    return job_ids
+
+
+def create_next_longform_book_batch(project_id: str) -> tuple[dict, list[str], list[str]]:
+    """Fetch only enough sequential Fanqie chapters to form the next batch."""
+    project = projects.load_project(project_id)
+    longform = projects.normalize_longform_settings(project.get("longform"))
+    source = longform.get("source") if isinstance(longform.get("source"), dict) else {}
+    if source.get("kind") != "book" or not source.get("reference"):
+        raise ValueError("当前项目不是可续作的书库来源")
+    if not longform.get("enabled"):
+        raise ValueError("请先在项目页开启按字数连续分集并保存")
+    scraper = _build_scraper(str(config.get("scraper_site") or "qingtian"))
+    if not isinstance(scraper, QingtianAggregateScraper):
+        scraper.close()
+        raise ValueError("长篇书库分集当前仅支持番茄/晴天书源")
+    # ``reserved_next_chapter`` advances as soon as a batch is materialized;
+    # completed_next_chapter advances only when every member is delivered.
+    # Never use the retired ``next_chapter`` field here, otherwise a second
+    # batch can silently restart from chapter one.
+    cursor = max(1, int(longform.get("reserved_next_chapter") or 1))
+    collected: list[NovelChapter] = []
+    warnings: list[str] = []
+    try:
+        for chapter_index in range(cursor, cursor + 500):
+            one = scraper.fetch_chapter_range(str(source["reference"]), chapter_index, chapter_index)
+            collected.extend(one.chapters)
+            episodes, warnings = plan_longform_episodes(
+                collected,
+                min_final_chars=int(longform["min_final_chars"]),
+                max_final_chars=int(longform["max_final_chars"]),
+                minimum_rewrite_ratio=_rewrite_length_ratio("ai_rewrite_min_length_ratio", 0.75),
+                count=int(longform["batch_episode_count"]),
+            )
+            if len(episodes) >= int(longform["batch_episode_count"]) and episodes[-1]["estimated_final_chars"] >= int(longform["min_final_chars"]):
+                break
+        else:
+            episodes, warnings = plan_longform_episodes(collected, min_final_chars=int(longform["min_final_chars"]), max_final_chars=int(longform["max_final_chars"]), minimum_rewrite_ratio=_rewrite_length_ratio("ai_rewrite_min_length_ratio", 0.75), count=int(longform["batch_episode_count"]))
+    finally:
+        scraper.close()
+    if not episodes:
+        raise RuntimeError("没有获取到可制作的章节")
+    settings_snapshot = _longform_settings_snapshot(longform)
+    batch = projects.create_longform_batch(project_id, episodes, settings_snapshot)
+    job_ids = create_longform_jobs_from_episodes(project_id, batch, episodes, str(source.get("title") or project.get("name") or "长篇"))
+    return batch, job_ids, warnings
+
+
+def _local_longform_chapters(path: Path) -> list[NovelChapter]:
+    text = path.read_text(encoding="utf-8", errors="ignore").replace("\r\n", "\n")
+    groups: list[tuple[str, list[str]]] = []
+    heading = ""
+    body: list[str] = []
+    found_heading = False
+    for line in text.split("\n"):
+        if _CHAPTER_HEADING_RE.match(line.strip()):
+            found_heading = True
+            if body:
+                groups.append((heading, body))
+            heading, body = line.strip(), []
+        else:
+            body.append(line)
+    if body:
+        groups.append((heading, body))
+    if found_heading:
+        return [NovelChapter(index=i, title=title or f"第{i}段", text="\n".join(lines).strip()) for i, (title, lines) in enumerate(groups, 1) if "\n".join(lines).strip()]
+    return [NovelChapter(index=segment.index + 1, title=f"第{segment.index + 1}段", text=segment.text) for segment in split_segments(text, target_min=500, target_max=1000)]
+
+
+def create_next_longform_local_batch(project_id: str) -> tuple[dict, list[str], list[str]]:
+    project = projects.load_project(project_id)
+    longform = projects.normalize_longform_settings(project.get("longform"))
+    source = longform.get("source") if isinstance(longform.get("source"), dict) else {}
+    if source.get("kind") not in {"txt", "job"}:
+        raise ValueError("当前项目不是本地 TXT 来源")
+    path = Path(str(source.get("reference") or ""))
+    if not path.is_file():
+        raise FileNotFoundError("长篇项目原文不存在")
+    expected_hash = str(source.get("source_hash") or "").strip()
+    if expected_hash and hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
+        raise RuntimeError("长篇项目原文已变化，请新建项目或重新绑定源文")
+    chapters = _local_longform_chapters(path)
+    cursor = max(1, int(longform.get("reserved_next_chapter") or 1))
+    episodes, warnings = plan_longform_episodes(chapters[cursor - 1:], min_final_chars=int(longform["min_final_chars"]), max_final_chars=int(longform["max_final_chars"]), minimum_rewrite_ratio=_rewrite_length_ratio("ai_rewrite_min_length_ratio", 0.75), count=int(longform["batch_episode_count"]))
+    if not episodes:
+        raise RuntimeError("没有剩余正文可创建任务组")
+    settings_snapshot = _longform_settings_snapshot(longform)
+    batch = projects.create_longform_batch(project_id, episodes, settings_snapshot)
+    job_ids = create_longform_jobs_from_episodes(project_id, batch, episodes, str(source.get("title") or project.get("name") or path.stem))
+    return batch, job_ids, warnings
+
+
+def _longform_settings_snapshot(longform: dict) -> dict:
+    """Freeze the planning choices that produced a durable task group."""
+    return {
+        "min_final_chars": int(longform.get("min_final_chars") or 22_000),
+        "max_final_chars": int(longform.get("max_final_chars") or 88_000),
+        "batch_episode_count": int(longform.get("batch_episode_count") or 5),
+        "project_name_memory_enabled": bool(longform.get("project_name_memory_enabled", False)),
+        "project_character_lock_enabled": bool(longform.get("project_character_lock_enabled", False)),
+        "rewrite_replacement_categories": list(longform.get("rewrite_replacement_categories") or ["人名"]),
+    }
 
 
 def queue_all_pending_jobs(*, on_log: LogFn = _noop) -> tuple[list[str], list[tuple[str, int]]]:
@@ -1591,6 +1888,54 @@ def stage_clean(
     return segs
 
 
+def plan_longform_episodes(
+    chapters: list[NovelChapter],
+    *,
+    min_final_chars: int,
+    max_final_chars: int,
+    minimum_rewrite_ratio: float,
+    count: int,
+) -> tuple[list[dict], list[str]]:
+    """Group consecutive source chapters into final-character-targeted episodes.
+
+    The maximum is a target boundary, not permission to cut a chapter.  A
+    source that ends before the minimum remains a valid final episode.
+    """
+    minimum = max(1, int(min_final_chars))
+    maximum = max(minimum, int(max_final_chars))
+    multiplier = max(0.001, float(minimum_rewrite_ratio))
+    target_count = max(1, int(count))
+    episodes: list[dict] = []
+    warnings: list[str] = []
+    cursor = 0
+    while cursor < len(chapters) and len(episodes) < target_count:
+        start = cursor
+        estimated_chars = 0.0
+        source_chars = 0
+        while cursor < len(chapters):
+            chapter = chapters[cursor]
+            chapter_chars = len(str(chapter.text or "")) * multiplier
+            if cursor > start and estimated_chars >= minimum and estimated_chars + chapter_chars > maximum:
+                break
+            estimated_chars += chapter_chars
+            source_chars += len(str(chapter.text or ""))
+            cursor += 1
+            if cursor == start + 1 and chapter_chars > maximum:
+                warnings.append(f"第{chapter.index}章预计洗稿后字数超过上限，已按完整章节保留。")
+                break
+        selected = chapters[start:cursor]
+        if not selected:
+            break
+        episodes.append({
+            "start_chapter": int(selected[0].index),
+            "end_chapter": int(selected[-1].index),
+            "estimated_final_chars": round(estimated_chars),
+            "source_char_count": source_chars,
+            "chapters": selected,
+        })
+    return episodes, warnings
+
+
 _CHAPTER_HEADING_RE = re.compile(
     r"^\s*(?:"
     r"第[\d零〇一二三四五六七八九十百千万两]+[章节章回话話卷集部篇].{0,40}|"
@@ -1671,12 +2016,45 @@ def _rewrite_story_text(text: str, on_log: LogFn = _noop, job_dir: Path | None =
         return source
 
     started_chars = len(source)
+    structured = bool(config.get("ai_rewrite_proper_noun_localization_enabled", False))
+    project_id = ""
+    project_memory = False
+    known_project_replacements: list[Replacement] = []
+    if job_dir is not None and structured:
+        status = _read_json(job_dir / "status.json", {})
+        project_id = str(status.get("project_id") or "") if isinstance(status, dict) else ""
+        # This flag is copied to status when the group is created.  Later UI
+        # edits apply only to a newly created group, never to queued episodes.
+        project = projects.load_project(project_id) if project_id else {}
+        project_memory = (
+            bool(status.get("longform_name_memory_enabled"))
+            if "longform_name_memory_enabled" in status
+            else bool((project.get("longform") or {}).get("project_name_memory_enabled", False))
+        )
+        if project_memory:
+            ledger = projects.load_project_name_ledger(project_id)
+            known_project_replacements = [
+                Replacement("专名", source, str(item.get("target") or ""), "", 0, True)
+                for source, item in ledger.get("mappings", {}).items()
+                if isinstance(item, dict) and str(source).strip() and str(item.get("target") or "").strip()
+            ]
     try:
-        rewritten = _ai_rewrite_paragraphs(paragraphs, on_log)
+        rewrite_result = _ai_rewrite_paragraphs(
+            paragraphs,
+            on_log,
+            source_text=source,
+            job_dir=job_dir,
+            known_replacements=known_project_replacements,
+        )
     except Exception as exc:
-        on_log(f"  WARN AI 洗稿失败，已保留原文: {exc}")
+        if job_dir is not None and structured:
+            _clear_rewrite_localization_artifacts(job_dir, include_final=True)
+        on_log(f"  WARN AI 洗稿失败，已保留原文: {redact_secret_text(exc)}")
         return source
+    rewritten = rewrite_result.text if isinstance(rewrite_result, RewriteRunResult) else rewrite_result
     if not rewritten.strip():
+        if job_dir is not None and structured:
+            _clear_rewrite_localization_artifacts(job_dir, include_final=True)
         on_log("  WARN AI 洗稿结果为空，已保留原文")
         return source
     report = {
@@ -1688,9 +2066,53 @@ def _rewrite_story_text(text: str, on_log: LogFn = _noop, job_dir: Path | None =
         "batch_chars": int(config.get("ai_rewrite_batch_chars", 3500) or 3500),
         "prompt_hash": _text_hash(str(config.get("ai_rewrite_prompt", "") or "")),
     }
+    replacement_report: dict | None = None
+    if isinstance(rewrite_result, RewriteRunResult):
+        if project_memory and project_id:
+            projects.merge_project_name_ledger(project_id, [
+                {"source": item.source, "target": item.target} for item in rewrite_result.replacements
+            ])
+        chars_after_model = len(rewritten)
+        rewritten = apply_replacements(rewritten, rewrite_result.replacements)
+        residuals = find_residual_sources(rewritten, rewrite_result.replacements)
+        warnings = list(rewrite_result.warnings)
+        if rewrite_result.language.warning:
+            warnings.append(rewrite_result.language.warning)
+        if residuals:
+            warnings.append("专名本地化后仍残留原词：" + "、".join(residuals[:12]))
+        report.update(
+            {
+                "mode": "structured_rewrite_localization",
+                "language": asdict(rewrite_result.language),
+                "mapping_count": len(rewrite_result.replacements),
+                "residual_count": len(residuals),
+                "min_length_ratio": _rewrite_length_ratio("ai_rewrite_min_length_ratio", 0.75),
+                "max_length_ratio": _rewrite_length_ratio("ai_rewrite_max_length_ratio", 1.35),
+                "batches": rewrite_result.batches,
+                "chars_after_model": chars_after_model,
+                "chars_after": len(rewritten),
+            }
+        )
+        replacement_report = {
+            "language": asdict(rewrite_result.language),
+            "replacements": [asdict(item) for item in rewrite_result.replacements],
+            "warnings": warnings,
+            "residual_sources": residuals,
+            "batches": rewrite_result.batches,
+        }
     if job_dir is not None:
-        _write_json(job_dir / "text_rewrite_report.json", report)
-        (job_dir / "text_rewritten.txt").write_text(rewritten, encoding="utf-8")
+        try:
+            _write_json(job_dir / "text_rewrite_report.json", report)
+            if replacement_report is not None:
+                _write_json(job_dir / REWRITE_REPLACEMENTS_FILE, replacement_report)
+            else:
+                _clear_rewrite_localization_artifacts(job_dir, include_final=False)
+            _write_text_atomically(job_dir / "text_rewritten.txt", rewritten)
+            (job_dir / REWRITE_CHECKPOINT_FILE).unlink(missing_ok=True)
+        except Exception:
+            if structured:
+                _clear_rewrite_localization_artifacts(job_dir, include_final=True)
+            raise
     on_log(f"  AI 洗稿改写完成：段落 {len(paragraphs)}，字数 {started_chars} -> {len(rewritten)}")
     return rewritten
 
@@ -2032,6 +2454,31 @@ def update_novel_project_series_settings(project_id: str, updates: dict) -> dict
     return project
 
 
+def update_novel_project_longform_settings(project_id: str, updates: dict) -> dict:
+    return projects.update_longform_settings(project_id, updates)
+
+
+def bind_novel_project_longform_source(project_id: str, *, kind: str, reference: str, title: str = "") -> dict:
+    return projects.bind_longform_source(project_id, kind=kind, reference=reference, title=title)
+
+
+def resume_novel_project_longform_batch(project_id: str, batch_id: str) -> dict:
+    """Resume a paused group at its failed member; completed members stay skipped."""
+    project = projects.resume_longform_batch(project_id, batch_id)
+    for batch in (project.get("longform") or {}).get("batches") or []:
+        if str(batch.get("batch_id") or "") != str(batch_id):
+            continue
+        for member in batch.get("members") or []:
+            if str(member.get("state") or "") == "completed":
+                continue
+            job_id = str(member.get("job_id") or "")
+            if job_id and job_dir_for(job_id).is_dir():
+                write_status(job_dir_for(job_id), stage="queued", worker_pid=None, error="")
+                append_log(job_dir_for(job_id), "longform batch resumed")
+        break
+    return project
+
+
 def series_video_settings_for_job(job_dir: Path) -> dict:
     status = _read_json(job_dir / "status.json", {})
     project_id = str(status.get("project_id") or "") if isinstance(status, dict) else ""
@@ -2202,21 +2649,8 @@ def set_job_series_animation_mode(job_id: str, mode: str) -> None:
     append_log(job_dir, f"series animation launch mode: {normalized}")
 
 
-def _ai_rewrite_paragraphs(paragraphs: list[str], on_log: LogFn) -> str:
+def _rewrite_batches(paragraphs: list[str]) -> tuple[list[list[str]], int]:
     batch_chars = max(800, int(config.get("ai_rewrite_batch_chars", 3500) or 3500))
-    max_tokens = max(1200, min(8192, int(batch_chars * 1.6)))
-    route = _llm_route_settings()
-    llm = LLMBackend(
-        provider=route["provider"],
-        base_url=route["base_url"],
-        api_key=route["api_key"],
-        model=route["model"],
-        system_prompt=str(config.get("ai_rewrite_prompt", "") or ""),
-        style_suffix="",
-        temperature=0.45,
-        max_tokens=max_tokens,
-        timeout=180.0,
-    )
     batches: list[list[str]] = []
     batch: list[str] = []
     size = 0
@@ -2230,6 +2664,27 @@ def _ai_rewrite_paragraphs(paragraphs: list[str], on_log: LogFn) -> str:
         size += len(para) + 2
     if batch:
         batches.append(batch)
+    return batches, batch_chars
+
+
+def _rewrite_llm(system_prompt: str, batch_chars: int) -> LLMBackend:
+    route = _llm_route_settings()
+    return LLMBackend(
+        provider=route["provider"],
+        base_url=route["base_url"],
+        api_key=route["api_key"],
+        model=route["model"],
+        system_prompt=system_prompt,
+        style_suffix="",
+        temperature=0.45,
+        max_tokens=max(1200, min(8192, int(batch_chars * 1.6))),
+        timeout=180.0,
+    )
+
+
+def _ai_rewrite_plaintext_batches(paragraphs: list[str], on_log: LogFn) -> str:
+    batches, batch_chars = _rewrite_batches(paragraphs)
+    llm = _rewrite_llm(str(config.get("ai_rewrite_prompt", "") or ""), batch_chars)
 
     rewritten_parts: list[str] = []
     for index, current in enumerate(batches, start=1):
@@ -2245,6 +2700,273 @@ def _ai_rewrite_paragraphs(paragraphs: list[str], on_log: LogFn) -> str:
             rewritten_parts.append(cleaned_reply)
         on_log(f"  AI 洗稿批次 {index}/{len(batches)} 完成")
     return "\n\n".join(part.strip() for part in rewritten_parts if part.strip()).strip()
+
+
+def _ai_rewrite_structured_batches(
+    paragraphs: list[str],
+    on_log: LogFn,
+    *,
+    source_text: str,
+    job_dir: Path | None,
+    known_replacements: list[Replacement] | None = None,
+) -> RewriteRunResult:
+    batches, batch_chars = _rewrite_batches(paragraphs)
+    language = detect_rewrite_language(source_text)
+    source_hash = _text_hash(source_text)
+    prompt_hash = _text_hash(str(config.get("ai_rewrite_prompt", "") or ""))
+    rewritten_parts: list[str] = []
+    replacements: list[Replacement] = list(known_replacements or [])
+    status = _read_json(job_dir / "status.json", {}) if job_dir is not None else {}
+    allowed_categories = set(status.get("longform_rewrite_replacement_categories") or []) if isinstance(status, dict) else set()
+    if not allowed_categories and isinstance(status, dict) and status.get("project_id"):
+        project = projects.load_project(str(status["project_id"]))
+        allowed_categories = set((project.get("longform") or {}).get("rewrite_replacement_categories") or [])
+    allowed_categories = allowed_categories or None
+    warnings: list[str] = []
+    batch_reports: list[dict] = []
+    checkpoint = _load_rewrite_checkpoint(
+        job_dir,
+        source_hash=source_hash,
+        prompt_hash=prompt_hash,
+        batch_count=len(batches),
+    )
+    if checkpoint is not None:
+        rewritten_parts = list(checkpoint["rewritten_parts"])
+        replacements = list(checkpoint["replacements"])
+        warnings = list(checkpoint["warnings"])
+        batch_reports = list(checkpoint["batches"])
+        on_log(f"  AI 洗稿：已恢复 {len(rewritten_parts)}/{len(batches)} 个有效批次")
+
+    min_ratio = _rewrite_length_ratio("ai_rewrite_min_length_ratio", 0.75)
+    max_ratio = _rewrite_length_ratio("ai_rewrite_max_length_ratio", 1.35)
+    for index, current in enumerate(batches, start=1):
+        if index <= len(rewritten_parts):
+            continue
+        current_text = "\n\n".join(current)
+        system_prompt, user_prompt = build_structured_rewrite_prompt(
+            skill=str(config.get("ai_rewrite_prompt", "") or ""),
+            language=language,
+            known_replacements=replacements,
+            batch_index=index,
+            batch_count=len(batches),
+            allowed_categories=allowed_categories,
+        )
+        llm = _rewrite_llm(system_prompt, batch_chars)
+        request = f"{user_prompt}\n\n【本批原文】\n{current_text}"
+        result = None
+        last_error = ""
+        rejected_candidates: list[dict[str, str]] = []
+        fallback_text = ""
+        for attempt in range(2):
+            attempt_request = request
+            if attempt:
+                attempt_request += (
+                    f"\n\n上一轮失败原因：{last_error}。"
+                    "请根据该原因修正。只返回完整 JSON，"
+                    "不得省略正文、字段或本批已有信息。"
+                )
+            with external_api_slot(action="ai rewrite localization"):
+                reply = llm.storyboard(attempt_request)
+            try:
+                parsed = parse_structured_rewrite_response(
+                    reply,
+                    source_text=current_text,
+                    batch_index=index,
+                    known_replacements=replacements,
+                    allowed_categories=allowed_categories,
+                )
+                quality_errors = validate_rewrite_quality(
+                    source_text=current_text,
+                    rewritten_text=parsed.rewritten_text,
+                    language=language,
+                    min_ratio=min_ratio,
+                    max_ratio=max_ratio,
+                )
+                if quality_errors:
+                    raise ValueError("；".join(quality_errors))
+                result = parsed
+                break
+            except ValueError as exc:
+                last_error = str(exc)
+                rejected_candidates.extend(
+                    extract_rejected_replacement_sources(reply, current_text)
+                )
+                try:
+                    raw_payload = json.loads(_strip_llm_fences(reply))
+                    candidate_text = str(raw_payload.get("rewritten_text") or "")
+                    if not validate_rewrite_quality(
+                        source_text=current_text,
+                        rewritten_text=candidate_text,
+                        language=language,
+                        min_ratio=min_ratio,
+                        max_ratio=max_ratio,
+                    ):
+                        fallback_text = candidate_text.strip()
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+                if attempt == 0:
+                    on_log(f"  WARN AI 洗稿批次 {index}/{len(batches)} 校验失败，正在重试：{last_error}")
+        if result is not None and rejected_candidates and not result.replacements:
+            fallback = build_deterministic_fallback_replacements(
+                rejected_candidates, current_text, index, replacements
+            )
+            if fallback:
+                result = RewriteBatchResult(
+                    rewritten_text=result.rewritten_text,
+                    replacements=tuple(fallback),
+                    warnings=tuple(result.warnings) + ("自动兜底专名映射已应用",),
+                )
+        if result is None:
+            fallback = build_deterministic_fallback_replacements(
+                rejected_candidates, current_text, index, replacements
+            )
+            if fallback and fallback_text:
+                result = RewriteBatchResult(
+                    rewritten_text=fallback_text,
+                    replacements=tuple(fallback),
+                    warnings=("自动兜底专名映射已应用",),
+                )
+        if result is None:
+            raise ValueError(f"AI 洗稿批次 {index}/{len(batches)} 未通过校验：{last_error}")
+        rewritten_parts.append(result.rewritten_text)
+        replacements.extend(result.replacements)
+        warnings.extend(result.warnings)
+        ratio = len(result.rewritten_text) / max(1, len(current_text))
+        batch_reports.append(
+            {
+                "batch": index,
+                "chars_before": len(current_text),
+                "chars_after": len(result.rewritten_text),
+                "length_ratio": round(ratio, 4),
+                "replacements_added": len(result.replacements),
+                "warnings": list(result.warnings),
+            }
+        )
+        _write_rewrite_checkpoint(
+            job_dir,
+            source_hash=source_hash,
+            prompt_hash=prompt_hash,
+            batch_count=len(batches),
+            rewritten_parts=rewritten_parts,
+            replacements=replacements,
+            warnings=warnings,
+            batches=batch_reports,
+        )
+        on_log(f"  AI 洗稿批次 {index}/{len(batches)} 完成，新增专名映射 {len(result.replacements)} 条")
+    return RewriteRunResult(
+        text="\n\n".join(part.strip() for part in rewritten_parts if part.strip()).strip(),
+        replacements=replacements,
+        warnings=warnings,
+        language=language,
+        batches=batch_reports,
+    )
+
+
+def _ai_rewrite_paragraphs(
+    paragraphs: list[str],
+    on_log: LogFn,
+    *,
+    source_text: str = "",
+    job_dir: Path | None = None,
+    known_replacements: list[Replacement] | None = None,
+) -> str | RewriteRunResult:
+    if not bool(config.get("ai_rewrite_proper_noun_localization_enabled", False)):
+        return _ai_rewrite_plaintext_batches(paragraphs, on_log)
+    return _ai_rewrite_structured_batches(
+        paragraphs,
+        on_log,
+        source_text=source_text or "\n\n".join(paragraphs),
+        job_dir=job_dir,
+        known_replacements=known_replacements,
+    )
+
+
+def _rewrite_length_ratio(key: str, default: float) -> float:
+    try:
+        value = float(config.get(key, default) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(0.01, min(10.0, value))
+
+
+def _write_rewrite_checkpoint(
+    job_dir: Path | None,
+    *,
+    source_hash: str,
+    prompt_hash: str,
+    batch_count: int,
+    rewritten_parts: list[str],
+    replacements: list[Replacement],
+    warnings: list[str],
+    batches: list[dict],
+) -> None:
+    if job_dir is None:
+        return
+    _write_json(
+        job_dir / REWRITE_CHECKPOINT_FILE,
+        {
+            "source_hash": source_hash,
+            "prompt_hash": prompt_hash,
+            "batch_count": batch_count,
+            "rewritten_parts": rewritten_parts,
+            "replacements": [asdict(item) for item in replacements],
+            "warnings": warnings,
+            "batches": batches,
+        },
+    )
+
+
+def _load_rewrite_checkpoint(
+    job_dir: Path | None,
+    *,
+    source_hash: str,
+    prompt_hash: str,
+    batch_count: int,
+) -> dict | None:
+    if job_dir is None:
+        return None
+    raw = _read_json(job_dir / REWRITE_CHECKPOINT_FILE, {})
+    if not isinstance(raw, dict) or (
+        raw.get("source_hash") != source_hash
+        or raw.get("prompt_hash") != prompt_hash
+        or raw.get("batch_count") != batch_count
+    ):
+        return None
+    rewritten_parts = raw.get("rewritten_parts")
+    raw_replacements = raw.get("replacements")
+    warnings = raw.get("warnings")
+    batches = raw.get("batches")
+    if not all(isinstance(value, list) for value in (rewritten_parts, raw_replacements, warnings, batches)):
+        return None
+    if len(rewritten_parts) >= batch_count or not all(isinstance(value, str) and value.strip() for value in rewritten_parts):
+        return None
+    try:
+        replacements = [Replacement(**item) for item in raw_replacements if isinstance(item, dict)]
+    except TypeError:
+        return None
+    if len(replacements) != len(raw_replacements):
+        return None
+    return {
+        "rewritten_parts": rewritten_parts,
+        "replacements": replacements,
+        "warnings": [str(item) for item in warnings],
+        "batches": [item for item in batches if isinstance(item, dict)],
+    }
+
+
+def _clear_rewrite_localization_artifacts(job_dir: Path, *, include_final: bool) -> None:
+    names = [REWRITE_REPLACEMENTS_FILE, REWRITE_CHECKPOINT_FILE]
+    if include_final:
+        names.extend(("text_rewritten.txt", "text_rewrite_report.json"))
+    for name in names:
+        (job_dir / name).unlink(missing_ok=True)
+
+
+def _write_text_atomically(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(str(text or ""), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _strip_llm_fences(text: str) -> str:
@@ -3121,7 +3843,8 @@ def reset_from_clean_reuse_images(job_id: str) -> dict:
         shutil.rmtree(audio_dir)
     for name in (
         ACCELERATION_PREFETCH_REPORT,
-        "text_rewritten.txt", "text_rewrite_report.json", "text_tts_ready.txt",
+        "text_rewritten.txt", "text_rewrite_report.json", REWRITE_REPLACEMENTS_FILE,
+        REWRITE_CHECKPOINT_FILE, "text_tts_ready.txt",
         "segments.json", "tts_auto_pronunciation_report.json",
     ):
         (job_dir / name).unlink(missing_ok=True)
@@ -3850,6 +4573,15 @@ def share_series_character_analysis(job_dir: Path, payload: dict | None, on_log:
     status = _read_json(job_dir / "status.json", {})
     project_id = str(status.get("project_id") or "").strip()
     if project_id:
+        project = projects.load_project(project_id)
+        longform = project.get("longform") if isinstance(project, dict) else {}
+        lock_enabled = (
+            bool(status.get("longform_character_lock_enabled"))
+            if "longform_character_lock_enabled" in status
+            else bool(longform.get("project_character_lock_enabled", False))
+        )
+        if isinstance(longform, dict) and longform.get("source") and not lock_enabled:
+            return payload
         merged = projects.merge_character_profiles(project_id, payload)
         if isinstance(merged, dict):
             _write_json(job_dir / "character_profiles.json", merged)
@@ -4152,6 +4884,15 @@ def stage_character_references(
     status = _read_json(job_dir / "status.json", {})
     project_id = str(status.get("project_id") or "").strip()
     project = projects.load_project(project_id) if project_id else {}
+    longform = project.get("longform") if isinstance(project, dict) else {}
+    lock_enabled = (
+        bool(status.get("longform_character_lock_enabled"))
+        if "longform_character_lock_enabled" in status
+        else bool(longform.get("project_character_lock_enabled", False))
+    )
+    if isinstance(longform, dict) and longform.get("source") and not lock_enabled:
+        project_id = ""
+        project = {}
     char_dir = (
         projects.project_dir(project_id) / "characters"
         if project
@@ -7389,6 +8130,7 @@ def _stage_compose_manifest_impl(
         italic=bool(config.get("video_subtitle_italic", False)),
         chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
         max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
+        traditional=bool(config.get("video_subtitle_traditional", False)),
     )
     # Always keep an SRT fallback. FFmpeg builds without libass cannot burn ASS
     # subtitles, but can still embed SRT as a selectable mov_text track.
@@ -7397,6 +8139,7 @@ def _stage_compose_manifest_impl(
         job_dir / "subtitle.srt",
         chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
         max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
+        traditional=bool(config.get("video_subtitle_traditional", False)),
     )
 
     bgm = Path(config.video_bgm_path) if config.video_bgm_path else None
@@ -7427,6 +8170,7 @@ def _stage_compose_manifest_impl(
                 "transition": str(config.video_transition or "none"),
                 "transition_duration": float(config.video_transition_duration or 0.4),
                 "subtitle": True,
+                "traditional": bool(config.get("video_subtitle_traditional", False)),
                 "subtitle_font": config.video_subtitle_font,
                 "subtitle_size": config.video_subtitle_size,
                 "subtitle_style": {
@@ -9155,18 +9899,21 @@ def run_full(
             worker_pid=None,
             finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
         )
+        complete_longform_batch_member_for_job(job_id)
         start_next_queued_job(exclude_job_id=job_id, on_log=log)
         return result
     except ImageGenerationSkipped as exc:
         safe_exc = redact_secret_text(exc)
         log(f"任务跳过: {safe_exc}")
         progress("failed", load_status(job_id).get("progress", 0), error=safe_exc, worker_pid=None, finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        pause_longform_batch_for_job(job_id, safe_exc)
         start_next_queued_job(exclude_job_id=job_id, on_log=log)
         return {"job_id": job_id, "skipped": True, "error": safe_exc}
     except Exception as exc:
         safe_exc = redact_secret_text(exc)
         log(f"ERROR 失败: {safe_exc}\n{redact_secret_text(traceback.format_exc())}")
         progress("failed", load_status(job_id).get("progress", 0), error=safe_exc, worker_pid=None, finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        pause_longform_batch_for_job(job_id, safe_exc)
         raise
 
 

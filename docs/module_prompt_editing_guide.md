@@ -22,7 +22,7 @@
 | 功能 | GUI 区域 | 主要文件 | 常见输出 |
 | --- | --- | --- | --- |
 | 小说搜索/采集 | 小说来源、搜索框 | `app/scrapers/`, `app/scrapers/source_catalog.py` | 导入文本、任务目录 |
-| 洗稿/改写 | AI 洗稿 | `app/pipeline_runner.py`, `app/backends/llm.py` | `text_rewritten.txt`, `text_rewrite_report.json` |
+| 洗稿/改写 | AI 洗稿 | `app/pipeline_runner.py`, `app/rewrite_localization.py`, `app/backends/llm.py` | `text_rewritten.txt`, `text_rewrite_report.json`, `text_rewrite_replacements.json` |
 | 分段/节奏 | 视频节奏、批量与上传 | `app/pipeline_runner.py`, `app/stages/stage_pacing.py` | `segments.json`, `plans.json` |
 | TTS | TTS 配置 | `app/backends/tts.py`, `app/tts_worker.py`, `app/pipeline_runner.py` | `audio/*.mp3`, `tts_manifest.json` |
 | 人设分析 | 图片与提示词 | `app/character_analysis.py`, `app/pipeline_runner.py` | `character_profiles.json` |
@@ -140,9 +140,13 @@ GUI 里显示为“AI 洗稿改写”。对应配置：
 
 - `ai_rewrite_enabled`：是否启用。
 - `ai_rewrite_batch_chars`：每批处理字符数。
-- `ai_rewrite_prompt`：洗稿系统提示词。
+- `ai_rewrite_prompt`：洗稿 Skill（可编辑），控制句式重构、叙事风格以及必须保留的剧情事实。
+- `ai_rewrite_proper_noun_localization_enabled`：是否开启专名本地化/改名（默认关闭）。
+- `ai_rewrite_min_length_ratio` / `ai_rewrite_max_length_ratio`：每批洗稿前后字数比例的质量门槛。
 
 开启后，洗稿发生在切片和 TTS 前。程序按批次请求文字模型，通过后写入 `text_rewritten.txt` 与 `text_rewrite_report.json`；接口不可用或请求失败时保留原文。
+
+开启“专名本地化”后，处理仍是同语种润色，不提供翻译：中文输入保持中文输出，日语输入保持日语输出。模型会在任务内为人名、地名、家族名、组织名、机构名、种族名提出稳定的新名称；后续批次继承已有映射，任务结束后程序以较长原词优先的顺序做统一替换。映射、语言判定、警告和旧名残留记录在 `text_rewrite_replacements.json`。单字或容易是普通词的名称不会被程序盲目全文替换，应查看该报告；重做洗稿和配音会清除任务内映射并重新生成。
 
 TTS 朗读净化由独立开关控制，可在洗稿关闭时单独执行并写入 `text_tts_ready.txt`。Edge 会处理容易读成“ダッシュ”的连续破折号并统一装饰标点；VOICEVOX 不删除或改写正常日文标点和原始换行，只清理明确的技术性垃圾字符。
 

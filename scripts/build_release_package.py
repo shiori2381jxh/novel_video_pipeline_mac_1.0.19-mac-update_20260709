@@ -38,6 +38,7 @@ PLATFORM_COPY_FILES = {
     ),
 }
 COPY_DIRS = ("app", "assets", "docs", "scripts", "prompts", "vendor", "TTS试听")
+WINDOWS_CONFIG_ATTACHMENT_DIR = "personal_config_windows_20260903"
 IGNORE_DIRS = {"__pycache__", ".git", ".venv", "dist"}
 IGNORE_SUFFIXES = {".pyc", ".pyo"}
 IGNORE_FILES = {".DS_Store"}
@@ -86,6 +87,24 @@ def safe_slug(text: str) -> str:
 def copy_file(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
+
+
+def copy_directory(src_dir: Path, dst_dir: Path, *, required: bool = False) -> None:
+    if not src_dir.is_dir():
+        if required:
+            raise RuntimeError(f"Missing required Windows configuration attachment: {src_dir}")
+        return
+    for src in src_dir.rglob("*"):
+        if src.is_dir():
+            continue
+        rel_path = src.relative_to(src_dir)
+        if any(part in IGNORE_DIRS for part in rel_path.parts):
+            continue
+        if src.name in IGNORE_FILES:
+            continue
+        if src.suffix in IGNORE_SUFFIXES:
+            continue
+        copy_file(src, dst_dir / rel_path)
 
 
 def scrub_settings(data: dict) -> dict:
@@ -137,20 +156,13 @@ def copy_source(staging: Path, target_platform: str) -> None:
         if src.exists():
             copy_file(src, staging / rel)
     for rel in COPY_DIRS:
-        src_dir = ROOT / rel
-        if not src_dir.exists():
-            continue
-        for src in src_dir.rglob("*"):
-            if src.is_dir():
-                continue
-            rel_path = src.relative_to(src_dir)
-            if any(part in IGNORE_DIRS for part in rel_path.parts):
-                continue
-            if src.name in IGNORE_FILES:
-                continue
-            if src.suffix in IGNORE_SUFFIXES:
-                continue
-            copy_file(src, staging / rel / rel_path)
+        copy_directory(ROOT / rel, staging / rel)
+    if target_platform == "windows":
+        copy_directory(
+            ROOT / WINDOWS_CONFIG_ATTACHMENT_DIR,
+            staging / WINDOWS_CONFIG_ATTACHMENT_DIR,
+            required=True,
+        )
 
 
 def copy_sanitized_data(staging: Path, target_platform: str) -> None:

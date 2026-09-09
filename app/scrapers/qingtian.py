@@ -194,6 +194,30 @@ class QingtianAggregateScraper:
                 time.sleep(self.delay)
         return novel
 
+    def fetch_chapter_range(self, url_or_id: str, start_chapter: int, end_chapter: int) -> Novel:
+        """Fetch an inclusive 1-based catalog range without downloading the full book."""
+        start = max(1, int(start_chapter))
+        end = max(start, int(end_chapter))
+        book = self._resolve_book(url_or_id)
+        title = str(book.get("book_name") or book.get("title") or book.get("name") or book.get("book_id"))
+        source = str(book.get("source") or self.source)
+        media = str(book.get("tab") or self.media)
+        book_id = str(book.get("book_id") or book.get("bookid") or book.get("id") or "")
+        if not book_id:
+            raise ValueError(f"无法识别聚合书源 book_id: {url_or_id}")
+        novel = Novel(site=self.site_name, novel_id=book_id, title=title, author=str(book.get("author") or ""), description=str(book.get("abstract") or book.get("intro") or ""))
+        catalog = self._fetch_catalog(book_id=book_id, source=source, media=media, detail_url=str(book.get("toc_url") or ""))
+        for index, chapter in enumerate(catalog, start=1):
+            if index < start or index > end or chapter.get("is_volume") or chapter.get("source") == "卷":
+                continue
+            text = self._fetch_content(chapter, source=source, media=media)
+            if text:
+                novel.chapters.append(NovelChapter(index=index, title=str(chapter.get("title") or f"第{index}章"), text=text))
+            delay = float(getattr(self, "delay", 0) or 0)
+            if delay:
+                time.sleep(delay)
+        return novel
+
     def fetch_ranking(self, ranking_type: str = "daily", limit: int = 10) -> list[dict]:
         # The aggregate source does not expose a universal ranking endpoint.
         return []

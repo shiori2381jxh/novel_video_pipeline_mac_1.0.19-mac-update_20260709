@@ -59,6 +59,59 @@ UI_FONT_SIZE = 12
 UI_SMALL_FONT_SIZE = 11
 UI_HEADING_FONT_SIZE = 13
 
+
+def _mousewheel_units(delta: int, platform: str) -> int:
+    """Translate Tk mouse-wheel deltas into canvas scroll units."""
+    if not delta:
+        return 0
+    units = -delta if platform == "darwin" else -int(delta / 120)
+    return units or (-1 if delta > 0 else 1)
+
+
+class CollapsibleSection(ttk.Frame):
+    """A titled ttk section whose content can be hidden without being reset."""
+
+    def __init__(self, parent, *, title, expanded=False, on_layout_changed=None):
+        super().__init__(parent)
+        self.expanded = bool(expanded)
+        self._on_layout_changed = on_layout_changed
+
+        header = ttk.Frame(self, relief=tk.RIDGE, borderwidth=1, padding=(9, 5))
+        header.pack(fill=tk.X)
+        label = ttk.Label(
+            header,
+            text=title,
+            font=(UI_FONT, UI_HEADING_FONT_SIZE, "bold"),
+            cursor="hand2",
+        )
+        label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.arrow = ttk.Label(
+            header,
+            text="▼" if self.expanded else "▶",
+            width=3,
+            anchor=tk.CENTER,
+            cursor="hand2",
+        )
+        self.arrow.pack(side=tk.RIGHT)
+        self.content = ttk.Frame(self, padding=(8, 4, 4, 4))
+
+        for widget in (header, label, self.arrow):
+            widget.bind("<Button-1>", self.toggle)
+        if self.expanded:
+            self.content.pack(fill=tk.X)
+
+    def toggle(self, _event=None):
+        self.expanded = not self.expanded
+        if self.expanded:
+            self.content.pack(fill=tk.X)
+            self.arrow.configure(text="▼")
+        else:
+            self.content.pack_forget()
+            self.arrow.configure(text="▶")
+        if self._on_layout_changed is not None:
+            self.after_idle(self._on_layout_changed)
+        return "break"
+
 # The fields remain editable so OpenAI-compatible relays can use a private
 # model name.  These choices are the maintained, production-oriented presets.
 TEXT_MODEL_OPTIONS = [
@@ -214,6 +267,18 @@ def _match_import_files(paths: list[str | Path], *, pair_within_parent: bool = F
         "unused_dictionaries": [path for path in dictionary_paths if path not in used_dictionary],
         "unsupported": unsupported,
     }
+
+
+def _split_preliminary_package_imports(paths: list[Path]) -> tuple[list[dict], list[Path]]:
+    """Separate validated preliminary packages from ordinary import inputs."""
+    packages: list[dict] = []
+    remaining: list[Path] = []
+    for path in paths:
+        if path.is_dir() and (path / pr.PRELIMINARY_PACKAGE_MANIFEST).is_file():
+            packages.append(pr.read_preliminary_package(path))
+        else:
+            remaining.append(path)
+    return packages, remaining
 
 
 def _choose_import_files_and_folders() -> list[Path]:
@@ -611,7 +676,7 @@ class PipelineGUI:
     def _build_source_panel(self, parent):
         notebook = ttk.Notebook(parent)
         self._source_notebook = notebook
-        notebook.pack(fill=tk.X, pady=(0, 8))
+        notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         library_tab = ttk.Frame(notebook, padding=8)
         file_tab = ttk.Frame(notebook, padding=8)
@@ -690,6 +755,11 @@ class PipelineGUI:
             command=self._add_selected_search,
             style="Primary.TButton",
         ).pack(side=tk.RIGHT)
+        ttk.Button(
+            library_actions,
+            text="加入长篇项目…",
+            command=self._add_selected_search_to_longform,
+        ).pack(side=tk.RIGHT, padx=(0, 6))
 
         import_row = ttk.Frame(file_tab)
         import_row.pack(fill=tk.X)
@@ -700,6 +770,11 @@ class PipelineGUI:
             command=self._import_files_or_folders,
         )
         import_button.pack(side=tk.LEFT)
+        ttk.Button(
+            import_row,
+            text="TXT 加入长篇项目…",
+            command=self._add_txt_to_longform,
+        ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(
             import_row,
             text="自动识别正文 TXT、同名 MP3 和同名读音词典",
@@ -732,13 +807,43 @@ class PipelineGUI:
         self.manual_text = scrolledtext.ScrolledText(file_tab, height=4, wrap=tk.WORD, font=(UI_FONT, UI_FONT_SIZE))
         self.manual_text.pack(fill=tk.X, pady=(2, 0))
 
+        project_scroll_host = ttk.Frame(project_tab)
+        project_scroll_host.pack(fill=tk.BOTH, expand=True)
+        project_canvas = tk.Canvas(project_scroll_host, highlightthickness=0, borderwidth=0)
+        project_scrollbar = ttk.Scrollbar(
+            project_scroll_host,
+            orient=tk.VERTICAL,
+            command=project_canvas.yview,
+        )
+        project_body = ttk.Frame(project_canvas, padding=8)
+        project_body_window = project_canvas.create_window(
+            (0, 0),
+            window=project_body,
+            anchor="nw",
+        )
+
+        def refresh_project_scrollregion(_event=None):
+            project_canvas.configure(scrollregion=project_canvas.bbox("all"))
+
+        def resize_project_body(event):
+            project_canvas.itemconfigure(project_body_window, width=event.width)
+            project_canvas.after_idle(refresh_project_scrollregion)
+
+        project_body.bind("<Configure>", refresh_project_scrollregion)
+        project_canvas.bind("<Configure>", resize_project_body)
+        project_canvas.configure(yscrollcommand=project_scrollbar.set)
+        project_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        project_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._project_canvas = project_canvas
+        self._project_scrollbar = project_scrollbar
+
         ttk.Label(
-            project_tab,
+            project_body,
             text="系列视频设置",
             font=(UI_FONT, UI_HEADING_FONT_SIZE + 2, "bold"),
         ).pack(anchor=tk.W, pady=(0, 6))
 
-        project_actions = ttk.Frame(project_tab)
+        project_actions = ttk.Frame(project_body)
         project_actions.pack(fill=tk.X)
         ttk.Button(
             project_actions,
@@ -766,7 +871,7 @@ class PipelineGUI:
             text="打开项目文件夹",
             command=self._open_selected_project_dir,
         ).pack(side=tk.LEFT, padx=(6, 0))
-        project_manage_actions = ttk.Frame(project_tab)
+        project_manage_actions = ttk.Frame(project_body)
         project_manage_actions.pack(fill=tk.X, pady=(6, 0))
         ttk.Button(
             project_manage_actions,
@@ -789,12 +894,14 @@ class PipelineGUI:
             command=self._migrate_legacy_projects,
         ).pack(side=tk.RIGHT)
 
-        series_settings = ttk.LabelFrame(
-            project_tab,
-            text="当前项目的统一名称与分集规则",
-            padding=8,
+        self._project_series_section = CollapsibleSection(
+            project_body,
+            title="当前项目的统一名称与分集规则",
+            expanded=True,
+            on_layout_changed=refresh_project_scrollregion,
         )
-        series_settings.pack(fill=tk.X, pady=(8, 0))
+        self._project_series_section.pack(fill=tk.X, pady=(8, 0))
+        series_settings = self._project_series_section.content
         series_settings.columnconfigure(1, weight=1)
         self.project_shared_novel_title_var = tk.StringVar()
         self.project_shared_title_locked_var = tk.BooleanVar(value=True)
@@ -867,7 +974,45 @@ class PipelineGUI:
             command=self._import_into_current_project,
         ).pack(side=tk.LEFT, padx=(6, 0))
 
-        project_tree_box = ttk.Frame(project_tab)
+        self._project_longform_section = CollapsibleSection(
+            project_body,
+            title="长篇连续制作（手动开启，书库和 TXT 通用）",
+            expanded=False,
+            on_layout_changed=refresh_project_scrollregion,
+        )
+        self._project_longform_section.pack(fill=tk.X, pady=(8, 0))
+        longform_settings = self._project_longform_section.content
+        self.project_longform_enabled_var = tk.BooleanVar(value=False)
+        self.project_longform_min_final_chars_var = tk.StringVar(value=str(config.get("longform_default_min_final_chars", 22000)))
+        self.project_longform_max_final_chars_var = tk.StringVar(value=str(config.get("longform_default_max_final_chars", 88000)))
+        self.project_longform_batch_count_var = tk.StringVar(value=str(config.get("longform_default_batch_episode_count", 5)))
+        self.project_longform_name_memory_var = tk.BooleanVar(value=False)
+        self.project_longform_character_lock_var = tk.BooleanVar(value=False)
+        self.project_longform_rewrite_categories_var = tk.StringVar(value="人名")
+        longform_row = ttk.Frame(longform_settings)
+        longform_row.pack(fill=tk.X)
+        ttk.Checkbutton(longform_row, text="启用按字数连续分集", variable=self.project_longform_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(longform_row, text="洗稿后最少字数").pack(side=tk.LEFT, padx=(16, 4))
+        ttk.Entry(longform_row, textvariable=self.project_longform_min_final_chars_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(longform_row, text="最多字数").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(longform_row, textvariable=self.project_longform_max_final_chars_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(longform_row, text="本轮集数").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(longform_row, textvariable=self.project_longform_batch_count_var, width=5).pack(side=tk.LEFT)
+        longform_flags = ttk.Frame(longform_settings)
+        longform_flags.pack(fill=tk.X, pady=(5, 0))
+        ttk.Checkbutton(longform_flags, text="项目级专名记忆（洗稿后跨集一致）", variable=self.project_longform_name_memory_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(longform_flags, text="项目级人设与参考图锁定", variable=self.project_longform_character_lock_var).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Label(longform_flags, text="替换类别").pack(side=tk.LEFT, padx=(16, 4))
+        ttk.Entry(longform_flags, textvariable=self.project_longform_rewrite_categories_var, width=24).pack(side=tk.LEFT)
+        ttk.Label(longform_settings, text="例如：人名、地名；仅替换填写的类别，城市名/地点按地名处理。", foreground="#666").pack(anchor=tk.W, pady=(5, 0))
+        ttk.Label(longform_settings, text="洗稿后不足最少字数会自动追加完整章节；单章超长会保留完整并提示。", foreground="#666").pack(anchor=tk.W, pady=(5, 0))
+        longform_actions = ttk.Frame(longform_settings)
+        longform_actions.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(longform_actions, text="保存长篇设置", command=self._save_current_project_series_settings).pack(side=tk.LEFT)
+        ttk.Button(longform_actions, text="创建本轮任务组", style="Primary.TButton", command=self._create_current_longform_batch).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(longform_actions, text="恢复已暂停任务组", command=self._resume_current_longform_batch).pack(side=tk.LEFT, padx=(6, 0))
+
+        project_tree_box = ttk.Frame(project_body)
         project_tree_box.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
         project_tree_box.columnconfigure(0, weight=1)
         project_tree_box.rowconfigure(0, weight=1)
@@ -888,6 +1033,43 @@ class PipelineGUI:
         self.project_tree.grid(row=0, column=0, sticky="nsew")
         project_scroll.grid(row=0, column=1, sticky="ns")
         self.project_tree.bind("<<TreeviewSelect>>", self._on_project_selected)
+
+        def pointer_inside(widget, event):
+            x = event.x_root
+            y = event.y_root
+            left = widget.winfo_rootx()
+            top = widget.winfo_rooty()
+            return left <= x < left + widget.winfo_width() and top <= y < top + widget.winfo_height()
+
+        def scroll_project(event, units=None):
+            if pointer_inside(self.project_tree, event):
+                return None
+            if units is None:
+                units = _mousewheel_units(int(getattr(event, "delta", 0) or 0), sys.platform)
+            if not units:
+                return None
+            project_canvas.yview_scroll(units, "units")
+            return "break"
+
+        def scroll_project_under_pointer(event, units=None):
+            if pointer_inside(project_canvas, event):
+                return scroll_project(event, units)
+            return None
+
+        project_canvas.bind("<MouseWheel>", scroll_project, add="+")
+        project_canvas.bind("<Button-4>", lambda event: scroll_project(event, -1), add="+")
+        project_canvas.bind("<Button-5>", lambda event: scroll_project(event, 1), add="+")
+        self.root.bind_all("<MouseWheel>", scroll_project_under_pointer, add="+")
+        self.root.bind_all(
+            "<Button-4>",
+            lambda event: scroll_project_under_pointer(event, -1),
+            add="+",
+        )
+        self.root.bind_all(
+            "<Button-5>",
+            lambda event: scroll_project_under_pointer(event, 1),
+            add="+",
+        )
 
         category_source_row = ttk.Frame(category_tab)
         category_source_row.pack(fill=tk.X)
@@ -979,7 +1161,13 @@ class PipelineGUI:
                     pass
             page = notebook.nametowidget(selected)
             page.update_idletasks()
-            notebook.configure(height=page.winfo_reqheight())
+            if page is project_tab:
+                available_height = parent.winfo_height()
+                if available_height > 1:
+                    notebook.configure(height=max(1, available_height - 8))
+                project_canvas.after_idle(refresh_project_scrollregion)
+            else:
+                notebook.configure(height=page.winfo_reqheight())
             if previous_sash is not None:
                 self.root.after_idle(lambda: left_pane.sashpos(0, previous_sash))
             category_active = page is category_tab
@@ -1862,9 +2050,18 @@ class PipelineGUI:
 
         section("洗稿")
         check("AI 洗稿改写", "ai_rewrite_enabled")
+        check("专名本地化/改名（任务内记忆）", "ai_rewrite_proper_noun_localization_enabled")
+        ttk.Label(
+            section_parent,
+            text="开启后在当前任务内统一改写人名、地名等专名；中文仍输出中文，日语仍输出日语。",
+            foreground="#666",
+            wraplength=520,
+        ).pack(anchor=tk.W, pady=(0, 4))
         check("TTS 朗读净化（独立于洗稿开关）", "tts_clean_rewritten_text")
         row("洗稿批大小", "ai_rewrite_batch_chars", "3500")
-        textrow("洗稿提示词", "ai_rewrite_prompt", str(config.get("ai_rewrite_prompt", "")), height=5)
+        row("洗稿最短比例", "ai_rewrite_min_length_ratio", "0.75")
+        row("洗稿最长比例", "ai_rewrite_max_length_ratio", "1.35")
+        textrow("洗稿 Skill（可编辑）", "ai_rewrite_prompt", str(config.get("ai_rewrite_prompt", "")), height=5)
 
         section("自动 TTS 读音审校")
         ttk.Label(
@@ -1997,6 +2194,7 @@ class PipelineGUI:
         row("最多行数", "video_subtitle_max_lines", "2")
         check("字幕粗体", "video_subtitle_bold")
         check("字幕斜体", "video_subtitle_italic")
+        check("繁体字幕", "video_subtitle_traditional")
         buttons(("预览字幕样式", self._preview_subtitle))
         check("内嵌字幕（强制）", "video_subtitle")
         check("导出 SRT", "video_external_subtitle")
@@ -2263,6 +2461,7 @@ class PipelineGUI:
         }
         float_keys = {
             "tts_volume", "tts_waveform_min_rms_db", "tts_waveform_max_silence_ratio",
+            "ai_rewrite_min_length_ratio", "ai_rewrite_max_length_ratio",
             "voicevox_speed_scale", "voicevox_intonation_scale", "voicevox_pause_scale",
             "pacing_seconds_per_image", "video_motion_cycle_seconds",
             "video_transition_duration", "cover_title_area_ratio",
@@ -2270,9 +2469,10 @@ class PipelineGUI:
             "short_video_blur_sigma",
         }
         bool_keys = {
-            "video_long_mode", "ken_burns", "video_subtitle", "video_external_subtitle",
+            "video_long_mode", "ken_burns", "video_subtitle", "video_external_subtitle", "video_subtitle_traditional",
             "upload_enabled", "cover_enabled", "video_subtitle_bold", "video_subtitle_italic",
             "short_title_enabled", "pipeline_overlap_tts_images", "ai_rewrite_enabled",
+            "ai_rewrite_proper_noun_localization_enabled",
             "character_analysis_enabled", "character_analysis_always_include_protagonists",
             "character_reference_enabled", "scene_inject_visual_theme", "scene_inject_character_triggers",
             "storyboard_highlight_enabled", "storyboard_highlight_align_timeline",
@@ -4105,6 +4305,38 @@ class PipelineGUI:
             if ref:
                 self._create_queued_job(str(values[0] or "book"), ref)
 
+    def _add_selected_search_to_longform(self):
+        selected = list(self.search_tree.selection())
+        if len(selected) != 1:
+            messagebox.showwarning("请选择一本书", "长篇项目一次只能绑定一本书。")
+            return
+        iid = selected[0]
+        ref = self._search_refs.get(iid, "")
+        values = self.search_tree.item(iid, "values")
+        title = str(values[0] or "长篇小说").strip()
+        if not ref:
+            messagebox.showwarning("书源无效", "这本书缺少可抓取的引用。")
+            return
+        project_name = simpledialog.askstring("加入长篇项目", "项目名称：", initialvalue=title, parent=self.root)
+        if not project_name or not project_name.strip():
+            return
+        try:
+            project = pr.create_novel_project(project_name.strip())
+            pr.bind_novel_project_longform_source(
+                str(project["project_id"]), kind="book", reference=ref, title=title,
+            )
+        except Exception as exc:
+            messagebox.showerror("创建长篇项目失败", str(exc))
+            return
+        self._source_notebook.select(self._source_project_tab)
+        self._rebuild_project_tree()
+        project_id = str(project["project_id"])
+        iid = next((key for key, value in self._project_tree_ids.items() if value == project_id), "")
+        if iid:
+            self.project_tree.selection_set(iid)
+            self.project_tree.see(iid)
+        self._load_current_project_series_settings()
+
     def _add_manual_text(self):
         text = self.manual_text.get("1.0", tk.END).strip()
         if not text:
@@ -4147,6 +4379,23 @@ class PipelineGUI:
                 "任务已设为跳过 TTS。\n字幕时间会按原文长度估算，视频总时长与 MP3 一致。",
             )
 
+    def _create_jobs_from_preliminary_packages(self, packages: list[dict]) -> tuple[int, list[str]]:
+        """Create fresh imported-audio jobs from validated preliminary packages."""
+        created = 0
+        errors: list[str] = []
+        for package in packages:
+            try:
+                job_id = self._create_queued_job(
+                    str(package["title"]),
+                    str(package["text_path"]),
+                    imported_audio_path=str(package["audio_path"]),
+                )
+                created += int(bool(job_id))
+            except Exception as exc:
+                package_dir = Path(package.get("package_dir") or "预备分包")
+                errors.append(f"{package_dir.name}: {exc}")
+        return created, errors
+
     def _import_files_or_folders(self):
         """Choose files/folders once, then recursively classify everything."""
         try:
@@ -4155,6 +4404,21 @@ class PipelineGUI:
             if sys.platform == "darwin":
                 self.root.after(100, self.root.focus_force)
         if not selected:
+            return
+        try:
+            preliminary_packages, selected = _split_preliminary_package_imports(selected)
+        except Exception as exc:
+            messagebox.showerror("预备分包无法导入", str(exc))
+            return
+        preliminary_created, preliminary_errors = self._create_jobs_from_preliminary_packages(preliminary_packages)
+        if preliminary_errors:
+            messagebox.showerror("预备分包未完全导入", "\n".join(preliminary_errors))
+        if not selected:
+            if preliminary_created:
+                messagebox.showinfo(
+                    "预备分包已导入",
+                    f"已新建 {preliminary_created} 个任务。开始任务后会调用图片 API 重新生图并合成正片。",
+                )
             return
         explicit_files = [path for path in selected if path.is_file()]
         folders, _nested_count = _remove_nested_import_folders(
@@ -4176,6 +4440,31 @@ class PipelineGUI:
             )
             return
         self._import_files(discovered, pair_within_parent=True)
+
+    def _add_txt_to_longform(self):
+        path = filedialog.askopenfilename(
+            title="选择要作为长篇来源的 TXT",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        source = Path(path).expanduser()
+        if not source.is_file() or source.suffix.lower() != ".txt":
+            messagebox.showwarning("文件无效", "请选择一份 TXT 正文。")
+            return
+        project_name = simpledialog.askstring("加入长篇项目", "项目名称：", initialvalue=source.stem, parent=self.root)
+        if not project_name or not project_name.strip():
+            return
+        try:
+            project = pr.create_novel_project(project_name.strip())
+            pr.bind_novel_project_longform_source(
+                str(project["project_id"]), kind="txt", reference=str(source.resolve()), title=source.stem,
+            )
+        except Exception as exc:
+            messagebox.showerror("创建长篇项目失败", str(exc))
+            return
+        self._source_notebook.select(self._source_project_tab)
+        self._rebuild_project_tree()
 
     def _import_files(
         self,
@@ -4369,6 +4658,21 @@ class PipelineGUI:
         """Recursively import selected novel folders after an explicit confirmation."""
         selected, nested_count = _remove_nested_import_folders(_choose_import_folders())
         if not selected:
+            return
+        try:
+            preliminary_packages, selected = _split_preliminary_package_imports(selected)
+        except Exception as exc:
+            messagebox.showerror("预备分包无法导入", str(exc))
+            return
+        preliminary_created, preliminary_errors = self._create_jobs_from_preliminary_packages(preliminary_packages)
+        if preliminary_errors:
+            messagebox.showerror("预备分包未完全导入", "\n".join(preliminary_errors))
+        if not selected:
+            if preliminary_created:
+                messagebox.showinfo(
+                    "预备分包已导入",
+                    f"已新建 {preliminary_created} 个任务。开始任务后会调用图片 API 重新生图并合成正片。",
+                )
             return
 
         imports: list[tuple[Path, dict]] = []
@@ -6600,9 +6904,10 @@ class PipelineGUI:
             return
         running = [job_id for job_id in ids if pr.is_worker_running(job_id)]
         message = (
-            f"将把 {len(ids)} 个任务整理为预备分包，仅保留 _source_input、正片 MP4、"
-            "正片 audio_full.mp3、cover、images，以及 shorts（Short MP4 与其 audio_full.mp3）。\n\n"
-            "其余文件（包括状态、字幕、分镜、日志和可续跑数据）会永久删除，任务无法再从此目录继续运行。"
+            f"将把 {len(ids)} 个任务整理为预备分包，不保留任何 MP4。\n\n"
+            "保留 _source_input、正片 audio_full.mp3、cover、images，以及 shorts 中的音频和文字资料。\n"
+            "以后可从“导入文件 / 文件夹”选择该预备分包，调用图片 API 重新生图并合成正片。\n\n"
+            "其余文件（包括状态、字幕、分镜、日志和可续跑数据）会永久删除，任务无法再从此目录继续运行。\n"
             "整理后的目录会放入 data/预备分，并命名为“预备分_原任务名”。"
         )
         if running:
@@ -7075,9 +7380,17 @@ class PipelineGUI:
             self.project_cover_label_template_var.set(
                 "{series_title}【{episode_label}】"
             )
+            self.project_longform_enabled_var.set(False)
+            self.project_longform_min_final_chars_var.set(str(config.get("longform_default_min_final_chars", 22000)))
+            self.project_longform_max_final_chars_var.set(str(config.get("longform_default_max_final_chars", 88000)))
+            self.project_longform_batch_count_var.set(str(config.get("longform_default_batch_episode_count", 5)))
+            self.project_longform_name_memory_var.set(False)
+            self.project_longform_character_lock_var.set(False)
+            self.project_longform_rewrite_categories_var.set("人名")
             return
         project = pr.load_novel_project(project_id)
         settings = project.get("series_video_settings") or {}
+        longform = project.get("longform") or {}
         self.project_shared_novel_title_var.set(
             str(settings.get("shared_novel_title") or project.get("name") or "")
         )
@@ -7106,6 +7419,13 @@ class PipelineGUI:
                 or "{series_title}【{episode_label}】"
             )
         )
+        self.project_longform_enabled_var.set(bool(longform.get("enabled", False)))
+        self.project_longform_min_final_chars_var.set(str(longform.get("min_final_chars") or 22000))
+        self.project_longform_max_final_chars_var.set(str(longform.get("max_final_chars") or 88000))
+        self.project_longform_batch_count_var.set(str(longform.get("batch_episode_count") or 5))
+        self.project_longform_name_memory_var.set(bool(longform.get("project_name_memory_enabled", False)))
+        self.project_longform_character_lock_var.set(bool(longform.get("project_character_lock_enabled", False)))
+        self.project_longform_rewrite_categories_var.set("、".join(longform.get("rewrite_replacement_categories") or ["人名"]))
 
     def _save_current_project_series_settings(self, *, show_result: bool = True) -> dict | None:
         project_id = self._selected_project_filter()
@@ -7122,6 +7442,13 @@ class PipelineGUI:
             messagebox.showwarning("集数起点无效", "集数起点必须填写正整数。")
             return None
         try:
+            longform_minimum = max(1, int(self.project_longform_min_final_chars_var.get().strip() or "22000"))
+            longform_maximum = max(longform_minimum, int(self.project_longform_max_final_chars_var.get().strip() or "88000"))
+            longform_count = max(1, int(self.project_longform_batch_count_var.get().strip() or "5"))
+        except ValueError:
+            messagebox.showwarning("长篇分集设置无效", "最少/最多字数和本轮集数必须填写正整数。")
+            return None
+        try:
             project = pr.update_novel_project_series_settings(
                 project_id,
                 {
@@ -7133,6 +7460,18 @@ class PipelineGUI:
                     "episode_label_style": self.project_episode_label_style_var.get().strip(),
                     "upload_title_template": self.project_upload_title_template_var.get().strip(),
                     "cover_label_template": self.project_cover_label_template_var.get().strip(),
+                },
+            )
+            project = pr.update_novel_project_longform_settings(
+                project_id,
+                {
+                    "enabled": self.project_longform_enabled_var.get(),
+                    "min_final_chars": longform_minimum,
+                    "max_final_chars": longform_maximum,
+                    "batch_episode_count": longform_count,
+                    "project_name_memory_enabled": self.project_longform_name_memory_var.get(),
+                    "project_character_lock_enabled": self.project_longform_character_lock_var.get(),
+                    "rewrite_replacement_categories": self.project_longform_rewrite_categories_var.get(),
                 },
             )
         except Exception as exc:
@@ -7149,6 +7488,57 @@ class PipelineGUI:
                 ),
             )
         return project
+
+    def _create_current_longform_batch(self):
+        project = self._save_current_project_series_settings(show_result=False)
+        if project is None:
+            return
+        longform = project.get("longform") or {}
+        if not longform.get("enabled"):
+            messagebox.showwarning("尚未开启长篇分集", "请勾选“启用按字数连续分集”并保存后再创建任务组。")
+            return
+        if not messagebox.askyesno(
+            "确认创建本轮任务组",
+            f"将从当前续作位置创建最多 {longform.get('batch_episode_count', 5)} 集。\n"
+            f"每集洗稿后目标 {longform.get('min_final_chars', 22000)}–{longform.get('max_final_chars', 88000)} 字，\n"
+            "不足最少字数会追加完整章节。创建后本组会按顺序独占队列。",
+            parent=self.root,
+        ):
+            return
+        try:
+            source = longform.get("source") or {}
+            creator = pr.create_next_longform_book_batch if source.get("kind") == "book" else pr.create_next_longform_local_batch
+            batch, job_ids, warnings = creator(str(project["project_id"]))
+        except Exception as exc:
+            messagebox.showerror("创建长篇任务组失败", str(exc))
+            return
+        self._rebuild_project_tree()
+        self._refresh_jobs()
+        messagebox.showinfo("长篇任务组已创建", f"已创建 {len(job_ids)} 集，批次 {batch['batch_id']}。\n请在任务队列点击“启动全部待处理任务”。" + ("\n" + "\n".join(warnings) if warnings else ""))
+
+    def _resume_current_longform_batch(self):
+        project_id = self._selected_project_filter()
+        if not project_id or project_id == "__independent__":
+            messagebox.showwarning("没有选择项目", "请先选择一个长篇项目。")
+            return
+        project = pr.load_novel_project(project_id)
+        paused = next(
+            (item for item in ((project.get("longform") or {}).get("batches") or []) if item.get("state") == "paused"),
+            None,
+        )
+        if not paused:
+            messagebox.showinfo("没有已暂停任务组", "当前项目没有可恢复的长篇任务组。")
+            return
+        if not messagebox.askyesno("恢复任务组", "将从失败/暂停的那一集继续；已完成的集不会重做。确定吗？", parent=self.root):
+            return
+        try:
+            pr.resume_novel_project_longform_batch(project_id, str(paused["batch_id"]))
+        except Exception as exc:
+            messagebox.showerror("恢复失败", str(exc))
+            return
+        self._rebuild_project_tree()
+        self._refresh_jobs()
+        messagebox.showinfo("任务组已恢复", "请点击“启动全部待处理任务”从暂停位置继续。")
 
     def _import_into_current_project(self):
         project = self._save_current_project_series_settings(show_result=False)
@@ -7222,6 +7612,27 @@ class PipelineGUI:
                 values=(len(jobs),),
             )
             self._project_tree_ids[iid] = project_id
+            for batch in ((project.get("longform") or {}).get("batches") or []):
+                members = batch.get("members") or []
+                completed = sum(1 for member in members if str(member.get("state") or "") == "completed")
+                state_labels = {
+                    "planned": "待生成",
+                    "queued": "排队中",
+                    "running": "制作中",
+                    "paused": "已暂停",
+                    "completed": "已完成",
+                }
+                batch_iid = tree.insert(
+                    iid,
+                    tk.END,
+                    text=(
+                        f"任务组 {str(batch.get('batch_id') or '')[-8:]}"
+                        f" · {state_labels.get(str(batch.get('state') or ''), '未知')}"
+                        f" · 第{batch.get('source_start', '?')}–{batch.get('source_end', '?')}章"
+                    ),
+                    values=(f"{completed}/{len(members)}",),
+                )
+                self._project_tree_ids[batch_iid] = project_id
             if previous == project_id:
                 selected_iid = iid
         tree.selection_set(selected_iid)

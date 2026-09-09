@@ -14,6 +14,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
+from opencc import OpenCC
+
 from app.config import config
 from app.concurrency import ffmpeg_slot
 from app.utils.ffmpeg import ffmpeg_path
@@ -21,6 +23,17 @@ from app.utils.ffmpeg import ffmpeg_path
 
 MOTION_RANDOM_POOL = ["vertical_pan", "horizontal_pan", "ken_burns", "pan_up", "pan_down", "pan_left", "pan_right"]
 TRANSITION_RANDOM_POOL = ["none", "fade", "fadeblack", "fadewhite"]
+
+
+@lru_cache(maxsize=1)
+def _subtitle_opencc() -> OpenCC:
+    return OpenCC("s2twp")
+
+
+def _convert_subtitle_text(text: str, traditional: bool) -> str:
+    if not traditional:
+        return text
+    return _subtitle_opencc().convert(text)
 
 
 def _parallel_limit(config_key: str, default: int, total: int, hard_cap: int = 8) -> int:
@@ -779,6 +792,7 @@ def build_ass(
     italic: bool = False,
     chars_per_line: int | None = None,
     max_lines: int = 2,
+    traditional: bool = False,
 ):
     alignment = _ass_alignment(position)
     header = f"""[Script Info]
@@ -800,7 +814,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     chars_per_line = max(6, int(chars_per_line))
     max_lines = max(1, int(max_lines or 1))
     lines = [header]
-    for start, end, text in _split_subtitle_events(segments_with_times, chars_per_line, max_lines):
+    for start, end, text in _split_subtitle_events(
+        segments_with_times, chars_per_line, max_lines, traditional=traditional
+    ):
         safe = _ass_escape(_wrap_text(text, chars_per_line, max_lines=max_lines))
         lines.append(f"Dialogue: 0,{_fmt_ass_time(start)},{_fmt_ass_time(end)},Default,,0,0,0,,{safe}")
     out_path.write_text("\n".join(lines), encoding="utf-8")
@@ -811,13 +827,14 @@ def build_srt(
     out_path: Path,
     chars_per_line: int | None = None,
     max_lines: int = 2,
+    traditional: bool = False,
 ):
     if chars_per_line is None or int(chars_per_line) <= 0:
         chars_per_line = 24
     chars_per_line = max(6, int(chars_per_line))
     max_lines = max(1, int(max_lines or 1))
     chunks: list[str] = []
-    events = _split_subtitle_events(segments_with_times, chars_per_line, max_lines)
+    events = _split_subtitle_events(segments_with_times, chars_per_line, max_lines, traditional=traditional)
     for i, (start, end, text) in enumerate(events, start=1):
         clean = re.sub(r"\s+", " ", html.unescape(text)).strip()
         chunks.append(f"{i}\n{_fmt_srt_time(start)} --> {_fmt_srt_time(end)}\n{clean}\n")
@@ -866,10 +883,11 @@ def _split_subtitle_events(
     segments_with_times: list[tuple[float, float, str]],
     chars_per_line: int,
     max_lines: int,
+    traditional: bool = False,
 ) -> list[tuple[float, float, str]]:
     events: list[tuple[float, float, str]] = []
     for start, end, text in segments_with_times:
-        clean = _normalize_subtitle_text(text)
+        clean = _convert_subtitle_text(_normalize_subtitle_text(text), traditional)
         if not clean:
             continue
         parts = _split_text_to_fit(clean, chars_per_line, max_lines)

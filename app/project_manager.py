@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import json
 import os
 import re
@@ -26,6 +27,7 @@ CHARACTER_RELATIONSHIPS_FILE = "character_relationships.json"
 NAME_REGISTRY_FILE = "name_registry.json"
 VISUAL_BIBLE_FILE = "visual_bible.json"
 CHARACTER_REFERENCE_MANIFEST_FILE = "character_reference_manifest.json"
+LONGFORM_NAME_LEDGER_FILE = "longform_name_ledger.json"
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
 _WRITE_LOCK = threading.RLock()
@@ -56,10 +58,73 @@ DEFAULT_SERIES_VIDEO_SETTINGS = {
     "upload_title_template": "{series_title}｜{episode_label}｜{ai_title}",
     "cover_label_template": "{series_title}【{episode_label}】",
 }
+DEFAULT_LONGFORM_SETTINGS = {
+    "enabled": False,
+    "min_final_chars": 22000,
+    "max_final_chars": 88000,
+    "batch_episode_count": 5,
+    "project_name_memory_enabled": False,
+    "project_character_lock_enabled": False,
+    "rewrite_replacement_categories": ["人名"],
+    "source": {},
+    "completed_next_chapter": 1,
+    "reserved_next_chapter": 1,
+    "batches": [],
+}
+
+
+def normalize_rewrite_replacement_categories(value: object) -> list[str]:
+    allowed = ("人名", "地名", "家族名", "组织名", "机构名", "种族名")
+    aliases = {"城市名": "地名", "地点": "地名", "種族名": "种族名"}
+    values = value if isinstance(value, list) else re.split(r"[、,，\n\r]+", str(value or ""))
+    result: list[str] = []
+    for item in values:
+        category = aliases.get(str(item).strip(), str(item).strip())
+        if category in allowed and category not in result:
+            result.append(category)
+    return result or ["人名"]
 
 
 def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def normalize_longform_settings(value: object) -> dict:
+    """Return a safe, backwards-compatible longform project record."""
+    raw = value if isinstance(value, dict) else {}
+    result = dict(DEFAULT_LONGFORM_SETTINGS)
+    result["enabled"] = bool(raw.get("enabled", result["enabled"]))
+    result["project_name_memory_enabled"] = bool(
+        raw.get("project_name_memory_enabled", result["project_name_memory_enabled"])
+    )
+    result["project_character_lock_enabled"] = bool(
+        raw.get("project_character_lock_enabled", result["project_character_lock_enabled"])
+    )
+    result["rewrite_replacement_categories"] = normalize_rewrite_replacement_categories(
+        raw.get("rewrite_replacement_categories")
+    )
+    for key, minimum in (("min_final_chars", 1), ("max_final_chars", 1), ("batch_episode_count", 1),
+                         ("completed_next_chapter", 1), ("reserved_next_chapter", 1)):
+        try:
+            result[key] = max(minimum, int(raw.get(key, result[key]) or result[key]))
+        except (TypeError, ValueError):
+            pass
+    if "min_final_chars" not in raw and "min_minutes" in raw:
+        try:
+            result["min_final_chars"] = max(1, int(raw.get("min_minutes") or 1)) * 22_000
+        except (TypeError, ValueError):
+            pass
+    if "max_final_chars" not in raw and "max_minutes" in raw:
+        try:
+            result["max_final_chars"] = max(1, int(raw.get("max_minutes") or 1)) * 22_000
+        except (TypeError, ValueError):
+            pass
+    result["max_final_chars"] = max(result["min_final_chars"], result["max_final_chars"])
+    source = raw.get("source")
+    result["source"] = dict(source) if isinstance(source, dict) else {}
+    batches = raw.get("batches")
+    result["batches"] = [dict(item) for item in batches if isinstance(item, dict)] if isinstance(batches, list) else []
+    return result
 
 
 def _read_json(path: Path, default):
@@ -190,6 +255,7 @@ def load_project(project_id: str) -> dict:
         value.get("series_video_settings"),
         project_name=str(value.get("name") or ""),
     )
+    value["longform"] = normalize_longform_settings(value.get("longform"))
     if legacy_without_series_settings:
         # Projects created by “项目添加1” used the old AI short-name flow.
         # Preserve that behavior until the operator explicitly saves settings.
@@ -261,6 +327,7 @@ def create_project(
             series_video_settings,
             project_name=clean_name,
         ),
+        "longform": normalize_longform_settings(None),
         "created_at": now,
         "updated_at": now,
     }
@@ -290,6 +357,7 @@ def save_project(project: dict) -> dict:
         merged.get("series_video_settings"),
         project_name=str(merged.get("name") or ""),
     )
+    merged["longform"] = normalize_longform_settings(merged.get("longform"))
     merged["updated_at"] = _now()
     _write_json(project_dir(project_id) / PROJECT_FILE, merged)
     return merged
@@ -322,6 +390,195 @@ def update_series_video_settings(project_id: str, updates: dict) -> dict:
         project_name=str(project.get("name") or ""),
     )
     return save_project(project)
+
+
+def update_longform_settings(project_id: str, updates: dict) -> dict:
+    """Persist editable longform settings without changing allocated batches."""
+    with _project_file_lock(project_id):
+        project = load_project(project_id)
+        if not project:
+            raise FileNotFoundError(f"项目不存在：{project_id}")
+        longform = normalize_longform_settings(project.get("longform"))
+        longform.update(updates if isinstance(updates, dict) else {})
+        project["longform"] = normalize_longform_settings(longform)
+        return save_project(project)
+
+
+def bind_longform_source(
+    project_id: str,
+    *,
+    kind: str,
+    reference: str,
+    title: str = "",
+    source_hash: str = "",
+) -> dict:
+    """Bind one durable source to a project before it has allocated episodes."""
+    clean_kind = str(kind or "").strip()
+    clean_reference = str(reference or "").strip()
+    if clean_kind not in {"book", "txt", "job"} or not clean_reference:
+        raise ValueError("长篇项目来源无效")
+    with _project_file_lock(project_id):
+        project = load_project(project_id)
+        if not project:
+            raise FileNotFoundError(f"项目不存在：{project_id}")
+        longform = normalize_longform_settings(project.get("longform"))
+        if longform["batches"]:
+            raise RuntimeError("项目已有长篇任务组，不能更换来源")
+        if clean_kind == "txt":
+            original = Path(clean_reference).expanduser()
+            if not original.is_file():
+                raise FileNotFoundError("长篇项目 TXT 原文不存在")
+            target = project_dir(project_id) / "longform_sources" / "source.txt"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(original, target)
+            clean_reference = str(target)
+            source_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+        longform["source"] = {
+            "kind": clean_kind,
+            "reference": clean_reference,
+            "title": str(title or project.get("name") or "").strip(),
+            "source_hash": str(source_hash or "").strip(),
+        }
+        project["longform"] = longform
+        return save_project(project)
+
+
+def _longform_batch(project: dict, batch_id: str) -> dict:
+    longform = normalize_longform_settings(project.get("longform"))
+    project["longform"] = longform
+    for batch in longform["batches"]:
+        if str(batch.get("batch_id") or "") == str(batch_id):
+            return batch
+    raise KeyError(f"长篇任务组不存在：{batch_id}")
+
+
+def create_longform_batch(project_id: str, episodes: list[dict], settings_snapshot: dict) -> dict:
+    """Reserve one contiguous source range before its jobs are materialized."""
+    if not episodes:
+        raise ValueError("长篇任务组不能为空")
+    with _project_file_lock(project_id):
+        project = load_project(project_id)
+        if not project:
+            raise FileNotFoundError(f"项目不存在：{project_id}")
+        longform = normalize_longform_settings(project.get("longform"))
+        active = {"planned", "queued", "running", "paused"}
+        if any(str(item.get("state") or "") in active for item in longform["batches"]):
+            raise RuntimeError("已有未结束的长篇任务组，请先完成或恢复该任务组")
+        members = []
+        expected_start = longform["reserved_next_chapter"]
+        for order, episode in enumerate(episodes, 1):
+            start = int(episode.get("start_chapter") or 0)
+            end = int(episode.get("end_chapter") or 0)
+            if start != expected_start or end < start:
+                raise ValueError("长篇分集章节范围不连续")
+            members.append({"order": order, "start_chapter": start, "end_chapter": end, "job_id": "", "state": "planned"})
+            expected_start = end + 1
+        batch = {
+            "batch_id": f"batch_{secrets.token_hex(8)}",
+            "state": "planned",
+            "members": members,
+            "source_start": members[0]["start_chapter"],
+            "source_end": members[-1]["end_chapter"],
+            "settings_snapshot": dict(settings_snapshot or {}),
+            "created_at": _now(),
+            "failed_job_id": "",
+            "error": "",
+        }
+        longform["reserved_next_chapter"] = expected_start
+        longform["batches"].append(batch)
+        project["longform"] = longform
+        save_project(project)
+        return batch
+
+
+def attach_longform_batch_jobs(project_id: str, batch_id: str, job_ids: list[str]) -> dict:
+    with _project_file_lock(project_id):
+        project = load_project(project_id)
+        batch = _longform_batch(project, batch_id)
+        if batch.get("state") != "planned" or len(job_ids) != len(batch.get("members") or []):
+            raise ValueError("长篇任务组不能附加这些任务")
+        for member, job_id in zip(batch["members"], job_ids):
+            member["job_id"] = str(job_id)
+            member["state"] = "queued"
+        batch["state"] = "queued"
+        return save_project(project)
+
+
+def pause_longform_batch(project_id: str, batch_id: str, job_id: str, error: str) -> dict:
+    with _project_file_lock(project_id):
+        project = load_project(project_id)
+        batch = _longform_batch(project, batch_id)
+        batch["state"] = "paused"
+        batch["failed_job_id"] = str(job_id)
+        batch["error"] = str(error)
+        for member in batch.get("members") or []:
+            if str(member.get("job_id") or "") == str(job_id):
+                member["state"] = "paused"
+        return save_project(project)
+
+
+def resume_longform_batch(project_id: str, batch_id: str) -> dict:
+    """Make a deliberately paused group eligible again, without creating a new range."""
+    with _project_file_lock(project_id):
+        project = load_project(project_id)
+        if not project:
+            raise FileNotFoundError(f"项目不存在：{project_id}")
+        batch = _longform_batch(project, batch_id)
+        if str(batch.get("state") or "") != "paused":
+            raise ValueError("只能恢复已暂停的长篇任务组")
+        for member in batch.get("members") or []:
+            if str(member.get("state") or "") == "paused":
+                member["state"] = "queued"
+        batch["state"] = "queued"
+        batch["failed_job_id"] = ""
+        batch["error"] = ""
+        return save_project(project)
+
+
+def complete_longform_member(project_id: str, batch_id: str, job_id: str) -> dict:
+    """Mark one delivered member complete and advance only after its full batch."""
+    with _project_file_lock(project_id):
+        project = load_project(project_id)
+        batch = _longform_batch(project, batch_id)
+        found = False
+        for member in batch.get("members") or []:
+            if str(member.get("job_id") or "") == str(job_id):
+                member["state"] = "completed"
+                found = True
+                break
+        if not found:
+            raise KeyError(f"任务不属于长篇任务组：{job_id}")
+        if all(str(member.get("state") or "") == "completed" for member in batch.get("members") or []):
+            batch["state"] = "completed"
+            longform = project["longform"]
+            longform["completed_next_chapter"] = max(
+                int(longform.get("completed_next_chapter") or 1), int(batch.get("source_end") or 0) + 1
+            )
+        else:
+            batch["state"] = "running"
+        return save_project(project)
+
+
+def load_project_name_ledger(project_id: str) -> dict:
+    value = _read_json(project_dir(project_id) / LONGFORM_NAME_LEDGER_FILE, {"mappings": {}})
+    mappings = value.get("mappings") if isinstance(value, dict) else {}
+    return {"project_id": project_id, "mappings": dict(mappings) if isinstance(mappings, dict) else {}}
+
+
+def merge_project_name_ledger(project_id: str, entries: list[dict]) -> dict:
+    """Append validated mappings without letting later batches rename a known person."""
+    with _project_file_lock(project_id):
+        if not load_project(project_id):
+            raise FileNotFoundError(f"项目不存在：{project_id}")
+        ledger = load_project_name_ledger(project_id)
+        for entry in entries:
+            source = str(entry.get("source") or "").strip()
+            target = str(entry.get("target") or "").strip()
+            if source and target and source not in ledger["mappings"]:
+                ledger["mappings"][source] = {"target": target, "created_at": _now()}
+        ledger["updated_at"] = _now()
+        _write_json(project_dir(project_id) / LONGFORM_NAME_LEDGER_FILE, ledger)
+        return ledger
 
 
 def archive_project(project_id: str) -> Path:
