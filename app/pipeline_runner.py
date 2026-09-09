@@ -5907,10 +5907,21 @@ def _marketing_topic_error(bundle: dict, *source_values) -> str:
 
 
 def _marketing_title_style_error(bundle: dict, language: str) -> str:
-    """Keep Chinese history candidates in a stable storytelling-program voice."""
+    """Reject title styles that create repetitive or unfinished uploads."""
+    titles = bundle.get("titles") if isinstance(bundle.get("titles"), list) else []
+    # Episode metadata is added once by the series upload layer.  Reject it
+    # from AI copy in every supported spelling/language so it cannot become
+    # ``第206話〜第208話 ... 第208話`` and consume the YouTube title limit.
+    episode_marker = re.compile(
+        r"第\s*[0-9０-９零〇一二两兩三四五六七八九十百千]+\s*"
+        r"(?:话|話|集|回|章|篇|部|期)"
+    )
+    if language == "zh" and any("三国志完全解说" in str(title or "") for title in titles):
+        return "candidate titles must not repeat the fixed series label"
+    if any(episode_marker.search(str(title or "")) for title in titles):
+        return "candidate titles must not contain episode/chapter labels"
     if language != "zh":
         return ""
-    titles = bundle.get("titles") if isinstance(bundle.get("titles"), list) else []
     question_openers = re.compile(r"(?:为什么|为何|何以|究竟|到底|怎么|如何|谁才|是否|难道)")
     question_like = [
         title for title in titles
@@ -5918,10 +5929,6 @@ def _marketing_title_style_error(bundle: dict, language: str) -> str:
     ]
     if len(question_like) > 1:
         return f"Chinese history titles use too many question hooks: {len(question_like)} (maximum 1)"
-    if any("三国志完全解说" in str(title or "") for title in titles):
-        return "candidate titles must not repeat the fixed series label"
-    if any(re.search(r"第\s*[0-9零〇一二两兩三四五六七八九十百千]+\s*话", str(title or "")) for title in titles):
-        return "candidate titles must not repeat the fixed episode label"
     return ""
 
 
@@ -6451,6 +6458,11 @@ def stage_metadata(
             "この範囲を超えるタイトルは返さず、文の途中で切らず、句読点または意味の完結する位置で"
             "内容を組み直してください。プログラム側でタイトルを途中切断することはありません。"
         )
+    prompt += (
+        "\n\n【重複禁止】候補タイトル本文には、第○話・第○集・第○回・第○章・第○篇などの"
+        "話数／章番号、話数の範囲、シリーズ名を一切入れないでください。これらはアップロード時に"
+        "プログラムが一度だけ付加します。タイトルは接続詞・助詞・読点の途中で終えず、必ず一文として完結させてください。"
+    )
     if _is_three_kingdoms_material(novel.title, novel.full_text, story_material):
         if marketing_language == "zh":
             prompt += (
@@ -6791,7 +6803,16 @@ def _limit_upload_title(text: str, max_chars: int = 100) -> str:
         if title.endswith(suffix) and limit > len(suffix) + 8:
             body = title[: limit - len(suffix)].rstrip(" ，。！？、,.!?;；:")
             return (body + suffix).strip()
-    return title[:limit].rstrip(" ，。！？、,.!?;；:")
+    prefix = title[:limit]
+    # CJK titles do not contain spaces where a safe word cut can be made.
+    # Prefer a completed clause rather than a raw character slice such as
+    # ``策を``.  A series separator is never a usable finishing point.
+    last_series_separator = prefix.rfind("｜")
+    boundaries = [prefix.rfind(mark) for mark in "。！？!?；;、，,：:"]
+    cut = max(boundaries, default=-1)
+    if cut > last_series_separator and cut >= max(last_series_separator + 8, int(limit * 0.45)):
+        return prefix[: cut + 1].rstrip(" 、，,：:")
+    return prefix.rstrip(" ，。！？、,.!?;；:")
 
 
 def _remove_disallowed_upload_tag(text: str) -> str:

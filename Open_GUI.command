@@ -14,7 +14,7 @@ export PYTHONUNBUFFERED=1
 
 pkill -f "python -m app.webui" 2>/dev/null || true
 
-check_gui_python() {
+check_tkinter() {
   [ -x ".venv/bin/python" ] || return 1
   set +e
   .venv/bin/python - <<'PY' >/dev/null 2>&1
@@ -25,15 +25,29 @@ PY
   return "$status"
 }
 
+check_app_dependencies() {
+  [ -x ".venv/bin/python" ] || return 1
+  set +e
+  .venv/bin/python - <<'PY' >/dev/null 2>&1
+import app.gui  # noqa: F401
+PY
+  local status=$?
+  set -e
+  return "$status"
+}
+
 if [ ! -x ".venv/bin/python" ]; then
   scripts/setup_macos.sh
-elif ! check_gui_python; then
+elif ! check_tkinter; then
   echo "[启动检查] 当前 .venv 的 Tkinter 不兼容，正在重建虚拟环境..."
   rm -rf .venv
   scripts/setup_macos.sh
+elif ! check_app_dependencies; then
+  echo "[启动检查] 更新后有新增 Python 依赖，正在补充安装..."
+  .venv/bin/python -m pip install -r requirements.txt
 fi
 
-if ! check_gui_python; then
+if ! check_tkinter || ! check_app_dependencies; then
   cat <<'EOF'
 [ERROR] GUI Python/Tkinter runtime is still not usable.
 

@@ -64,7 +64,11 @@ def _mousewheel_units(delta: int, platform: str) -> int:
     """Translate Tk mouse-wheel deltas into canvas scroll units."""
     if not delta:
         return 0
-    units = -delta if platform == "darwin" else -int(delta / 120)
+    if platform == "darwin":
+        direction = -1 if delta > 0 else 1
+        steps = max(1, round(abs(delta) / 120)) if abs(delta) >= 120 else 1
+        return direction * min(steps, 3)
+    units = -int(delta / 120)
     return units or (-1 if delta > 0 else 1)
 
 
@@ -588,6 +592,7 @@ class PipelineGUI:
         # libraries.
         self._job_table_refresh_key = None
         self._next_category_table_refresh_at = 0.0
+        self._next_project_table_refresh_at = 0.0
         self._next_image_failure_scan_at = 0.0
         self._pronunciation_resolution_cache: dict[str, dict[str, str]] = {}
         self._edge_available_voices: set[str] | None = None
@@ -7651,11 +7656,11 @@ class PipelineGUI:
         self.job_tree.selection_remove(self.job_tree.selection())
         self._selected_job = ""
         self._load_current_project_series_settings()
-        self._refresh_jobs()
+        self._refresh_jobs(force=True)
 
     def _project_job_rows(self) -> list[tuple[dict, dict]]:
         rows = [
-            (row, pr.load_status(row["job_id"]))
+            (row, row.get("_status") or pr.load_status(row["job_id"]))
             for row in pr.list_jobs(limit=10000)
         ]
         selected = self._selected_project_filter()
@@ -8321,7 +8326,10 @@ class PipelineGUI:
             if not force and time.monotonic() < self._next_category_table_refresh_at:
                 return
         elif project_active:
-            poll_key = None
+            selected_project = self._selected_project_filter()
+            poll_key = ("project", base_poll_key, selected_project)
+            if not force and time.monotonic() < self._next_project_table_refresh_at:
+                return
         else:
             poll_key = base_poll_key
         if not force and poll_key is not None and poll_key == self._job_table_refresh_key:
@@ -8377,6 +8385,8 @@ class PipelineGUI:
         self._job_table_refresh_key = poll_key
         if category_active:
             self._next_category_table_refresh_at = time.monotonic() + 10.0
+        elif project_active:
+            self._next_project_table_refresh_at = time.monotonic() + 5.0
 
     def _youtube_queue_status(self, job_id: str, status: dict) -> str:
         """Return a clear upload state for the queue's YouTube column."""

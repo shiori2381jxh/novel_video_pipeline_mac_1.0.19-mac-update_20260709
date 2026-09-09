@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw
 from app import config as config_module
 from app import pipeline_runner
 from app import project_manager
-from app.gui import PipelineGUI, _choose_import_folders
+from app.gui import PipelineGUI, _choose_import_folders, _mousewheel_units
 from app.character_analysis import normalize_analysis
 from app.backends.image import ImageBackend
 from app.backends import tts as tts_backend_module
@@ -29,6 +29,16 @@ from app.backends.tts import (
 from app.stages.stage6_compose import _video_encoder_args
 from app.storyboard_highlights import parse_json_object
 from app.tts_audition import audition_directory, audition_filename, audition_text_for_voice
+
+
+class MouseWheelRegressionTests(unittest.TestCase):
+    def test_macos_mouse_wheel_does_not_jump_120_rows(self):
+        self.assertEqual(_mousewheel_units(120, "darwin"), -1)
+        self.assertEqual(_mousewheel_units(-120, "darwin"), 1)
+
+    def test_macos_trackpad_delta_keeps_direction(self):
+        self.assertEqual(_mousewheel_units(3, "darwin"), -1)
+        self.assertEqual(_mousewheel_units(-3, "darwin"), 1)
 
 
 class ImagePromptRegressionTests(unittest.TestCase):
@@ -73,6 +83,45 @@ class ImagePromptRegressionTests(unittest.TestCase):
         self.assertTrue(converted.startswith(original))
         self.assertIn("Output aspect ratio 9:16", converted)
         self.assertIn("output size 1024x1792", converted)
+
+    def test_kiyo_safe_zone_is_injected_only_when_enabled(self):
+        with patch.object(
+            pipeline_runner.config,
+            "get",
+            side_effect=lambda key, default=None: {
+                "cover_mascot_overlay_enabled": True,
+                "cover_mascot_position": "top_left",
+                "cover_mascot_box_width_ratio": 0.27,
+                "cover_mascot_box_height_ratio": 0.40,
+            }.get(key, default),
+        ):
+            instruction = pipeline_runner._cover_mascot_safe_zone_instruction()
+        self.assertIn("upper-left", instruction)
+        self.assertIn("27% width by 40% height", instruction)
+        self.assertIn("episode number", instruction)
+
+    def test_cover_mascot_composites_transparent_asset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cover = Path(tmp) / "cover.jpg"
+            asset = Path(tmp) / "mascot.png"
+            Image.new("RGB", (640, 360), (240, 240, 240)).save(cover)
+            mascot = Image.new("RGBA", (100, 160), (0, 0, 0, 0))
+            ImageDraw.Draw(mascot).rectangle((20, 20, 80, 150), fill=(220, 20, 20, 255))
+            mascot.save(asset)
+            settings = {
+                "cover_mascot_margin_ratio": 0.02,
+                "cover_mascot_box_width_ratio": 0.27,
+                "cover_mascot_box_height_ratio": 0.40,
+                "cover_mascot_position": "top_left",
+            }
+            with patch.object(
+                pipeline_runner.config,
+                "get",
+                side_effect=lambda key, default=None: settings.get(key, default),
+            ):
+                pipeline_runner.render_cover_mascot(cover, asset)
+            rendered = Image.open(cover).convert("RGB")
+            self.assertGreater(rendered.getpixel((45, 45))[0], rendered.getpixel((45, 45))[1])
 
 
 class ShortScriptRegressionTests(unittest.TestCase):
@@ -166,6 +215,27 @@ class ShortScriptRegressionTests(unittest.TestCase):
             pipeline_runner._marketing_title_style_error(bundle, "zh"),
         )
 
+    def test_marketing_titles_reject_episode_labels_in_all_languages(self):
+        for language, title in (
+            ("ja", "第206話〜第208話、孫策が袁術の要請を拒み討伐を決断する"),
+            ("zh", "第206集到第208集，孙策拒绝袁术求援并决定出兵讨伐"),
+        ):
+            with self.subTest(language=language):
+                self.assertIn(
+                    "episode/chapter labels",
+                    pipeline_runner._marketing_title_style_error({"titles": [title]}, language),
+                )
+
+    def test_upload_title_shortens_at_complete_cjk_clause(self):
+        title = (
+            "孫権を狙う復讐者｜第208話｜"
+            "呂布に大敗した袁術が孫策へ援軍を求めるも、"
+            "孫策は漢に背いた逆賊として拒み討伐を宣言する長い後半部分"
+        )
+        limited = pipeline_runner._limit_upload_title(title, 48)
+        self.assertEqual(limited, "孫権を狙う復讐者｜第208話｜呂布に大敗した袁術が孫策へ援軍を求めるも")
+        self.assertLessEqual(len(limited), 48)
+
     def test_cover_prompt_blocks_unresolved_internal_tokens(self):
         self.assertIn(
             "source_episode_label",
@@ -185,6 +255,20 @@ class ShortScriptRegressionTests(unittest.TestCase):
             ),
             "",
         )
+
+    def test_source_episode_label_template_resolves_before_cover_render(self):
+        template = "【三国志完全解说】{source_episode_label}"
+        title = "三国群英志1_润色"
+        rendered = pipeline_runner._format_template(
+            template,
+            {
+                "source_episode": pipeline_runner._source_episode_from_job_name(title),
+                "source_episode_range": pipeline_runner._source_episode_range_from_job_name(title),
+                "source_episode_label": pipeline_runner._source_episode_label_from_job_name(title),
+            },
+        )
+        self.assertEqual(rendered, "【三国志完全解说】第1话")
+        self.assertEqual(pipeline_runner._cover_prompt_internal_token_error(rendered), "")
 
     def test_cover_text_guard_is_language_neutral_and_forbids_microtext(self):
         prompt = pipeline_runner._policy_safe_image_prompt(

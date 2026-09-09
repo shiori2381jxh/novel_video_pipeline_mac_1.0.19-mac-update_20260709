@@ -1025,22 +1025,22 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
         ):
             data.setdefault(key, DEFAULT_SETTINGS[key])
     if saved_version < 57:
-        for key in (
-            "longform_default_min_minutes",
-            "longform_default_max_minutes",
+        data.setdefault(
             "longform_default_batch_episode_count",
-        ):
-            data.setdefault(key, DEFAULT_SETTINGS[key])
+            DEFAULT_SETTINGS["longform_default_batch_episode_count"],
+        )
     if saved_version < 58:
         # Longform episodes now target the actual narration length.  Retain
         # user intent from the former minute-based controls at 22k chars/hour.
+        min_minutes = max(1, int(data.get("longform_default_min_minutes") or 60))
+        max_minutes = max(min_minutes, int(data.get("longform_default_max_minutes") or 240))
         data.setdefault(
             "longform_default_min_final_chars",
-            max(1, int(data.get("longform_default_min_minutes") or 1)) * 22_000,
+            round(min_minutes * 22_000 / 60),
         )
         data.setdefault(
             "longform_default_max_final_chars",
-            max(1, int(data.get("longform_default_max_minutes") or 1)) * 22_000,
+            round(max_minutes * 22_000 / 60),
         )
         data["longform_default_max_final_chars"] = max(
             int(data["longform_default_min_final_chars"]),
