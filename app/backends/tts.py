@@ -564,8 +564,8 @@ def discover_edge_voices() -> list[str]:
 
     return asyncio.run(_list())
 
-# GUI codes: first digit = gender (1 female / 2 male), second = character,
-# third = style.  Values are translated to VOICEVOX's own speaker IDs above.
+# GUI codes identify curated voices by gender/character/style slots; values are
+# translated to VOICEVOX's own speaker IDs above.
 VOICEVOX_FREQUENT_VOICE_IDS = {
     111: 2, 112: 0, 113: 6, 114: 4, 115: 36, 116: 37,  # 四国めたん
     121: 8,  # 春日部つむぎ
