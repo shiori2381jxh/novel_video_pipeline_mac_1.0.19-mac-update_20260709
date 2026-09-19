@@ -42,6 +42,7 @@ from app.scrapers.qingtian import QingtianAggregateScraper, parse_host_list
 from app.scrapers.source_catalog import SourceCatalogScraper
 from app.scrapers.syosetu import SyosetuScraper
 from app.stages.stage2_clean import Segment, split_segments
+from app.text_annotations import has_inline_furigana, subtitle_display_text, tts_narration_text
 from app.stages.stage6_compose import (
     build_ass,
     build_blurred_portrait_short,
@@ -1933,7 +1934,7 @@ def stage_clean(
     else:
         text = _strip_story_scaffold(novel.full_text, novel, on_log=on_log, job_dir=job_dir)
         text = _rewrite_story_text(text, on_log=on_log, job_dir=job_dir)
-        if bool(config.get("tts_clean_rewritten_text", True)):
+        if bool(config.get("tts_clean_rewritten_text", True)) and not has_inline_furigana(text):
             text = _clean_rewritten_narration_text(text, on_log=on_log, job_dir=job_dir)
         pronunciation_result = _generate_auto_pronunciation_dictionary(text, on_log=on_log, job_dir=job_dir)
         if bool(config.get("tts_inline_pronunciation_enabled", False)) and pronunciation_result.get("path"):
@@ -4146,6 +4147,31 @@ def reset_tts_unfinished_segments(job_id: str) -> dict:
     return {"job_id": job_id, "changed": len(changed), "segments": changed}
 
 
+def _rebuild_legacy_furigana_segments(job_dir: Path) -> bool:
+    """Restore annotation-bearing segments when an old cleaner lost parentheses.
+
+    The old representation (for example ``世よ``) is ambiguous.  Rebuild only
+    when the durable source still contains inline annotations and the current
+    segments contain none; existing images remain untouched by this helper.
+    """
+    segments = _load_job_segments(job_dir)
+    if any(has_inline_furigana(segment.text) for segment in segments):
+        return False
+    novel = _read_saved_novel(job_dir / "novel.json")
+    if novel is None or not has_inline_furigana(novel.full_text):
+        return False
+    rebuilt = stage_clean(
+        novel,
+        on_log=lambda message: append_log(job_dir, message),
+        job_dir=job_dir,
+    )
+    if not any(has_inline_furigana(segment.text) for segment in rebuilt):
+        raise RuntimeError("原始正文含日文括号注音，但重新处理后未保留注音；已停止重做 TTS。")
+    _write_json(job_dir / "segments.json", [{"i": segment.index, "text": segment.text} for segment in rebuilt])
+    append_log(job_dir, "legacy furigana segments rebuilt from saved source; existing images will be reused")
+    return True
+
+
 def redo_all_tts_reuse_images(job_id: str) -> dict:
     """Regenerate every TTS segment, then recompose strictly with existing images.
 
@@ -4163,6 +4189,8 @@ def redo_all_tts_reuse_images(job_id: str) -> dict:
     segments = _load_job_segments(job_dir)
     if not segments:
         raise RuntimeError("没有可用的文本分段，无法重做 TTS。")
+    if _rebuild_legacy_furigana_segments(job_dir):
+        segments = _load_job_segments(job_dir)
 
     # Usually plans.json is still available here.  It may already have been
     # cleared when an AI dictionary was applied, though; existing scene images
@@ -8573,7 +8601,7 @@ def _stage_compose_manifest_impl(
     t = 0.0
     for seg, dur in zip(segments, durations):
         end = t + max(0.05, dur)
-        subs.append((t, end, seg.text))
+        subs.append((t, end, subtitle_display_text(seg.text)))
         t = end
 
     ass_path = job_dir / "subtitle.ass"
@@ -9145,7 +9173,7 @@ def stage_short_video(
     cursor = 0.0
     for segment, duration in zip(short_segments, durations):
         end = cursor + max(0.05, float(duration))
-        subs.append((cursor, end, segment.text))
+        subs.append((cursor, end, subtitle_display_text(segment.text)))
         cursor = end
     ass_path = short_dir / "short_subtitle.ass"
     build_ass(
