@@ -40,6 +40,7 @@ personal_config_windows_20260903/
 # Local agent metadata
 .agents/
 .codex/
+.worktrees/
 
 # Machine-specific helper state
 tools/srt_audio_video_tool/project_path.txt
