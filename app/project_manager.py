@@ -60,7 +60,8 @@ DEFAULT_SERIES_VIDEO_SETTINGS = {
 }
 DEFAULT_LONGFORM_SETTINGS = {
     "enabled": False,
-    "min_final_chars": 22000,
+    "min_final_chars": 18000,
+    "target_final_chars": 22000,
     "max_final_chars": 88000,
     "batch_episode_count": 5,
     "project_name_memory_enabled": False,
@@ -103,7 +104,7 @@ def normalize_longform_settings(value: object) -> dict:
     result["rewrite_replacement_categories"] = normalize_rewrite_replacement_categories(
         raw.get("rewrite_replacement_categories")
     )
-    for key, minimum in (("min_final_chars", 1), ("max_final_chars", 1), ("batch_episode_count", 1),
+    for key, minimum in (("min_final_chars", 1), ("target_final_chars", 1), ("max_final_chars", 1), ("batch_episode_count", 1),
                          ("completed_next_chapter", 1), ("reserved_next_chapter", 1)):
         try:
             result[key] = max(minimum, int(raw.get(key, result[key]) or result[key]))
@@ -120,6 +121,9 @@ def normalize_longform_settings(value: object) -> dict:
         except (TypeError, ValueError):
             pass
     result["max_final_chars"] = max(result["min_final_chars"], result["max_final_chars"])
+    result["target_final_chars"] = min(
+        result["max_final_chars"], max(result["min_final_chars"], result["target_final_chars"])
+    )
     source = raw.get("source")
     result["source"] = dict(source) if isinstance(source, dict) else {}
     batches = raw.get("batches")

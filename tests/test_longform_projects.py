@@ -15,7 +15,8 @@ def test_new_project_persists_disabled_editable_longform_defaults(monkeypatch, t
 
     assert project["longform"] == {
         "enabled": False,
-        "min_final_chars": 22000,
+        "min_final_chars": 18000,
+        "target_final_chars": 22000,
         "max_final_chars": 88000,
         "batch_episode_count": 5,
         "project_name_memory_enabled": False,
@@ -54,7 +55,8 @@ def test_paused_batch_keeps_completed_cursor_and_reserves_its_range(monkeypatch,
 
 
 def test_longform_defaults_are_part_of_editable_production_settings():
-    assert DEFAULT_SETTINGS["longform_default_min_final_chars"] == 22_000
+    assert DEFAULT_SETTINGS["longform_default_min_final_chars"] == 18_000
+    assert DEFAULT_SETTINGS["longform_default_target_final_chars"] == 22_000
     assert DEFAULT_SETTINGS["longform_default_max_final_chars"] == 88_000
     assert DEFAULT_SETTINGS["longform_default_batch_episode_count"] == 5
 
@@ -64,6 +66,15 @@ def test_old_minute_longform_record_migrates_to_final_character_range():
 
     assert settings["min_final_chars"] == 44_000
     assert settings["max_final_chars"] == 66_000
+    assert settings["target_final_chars"] == 44_000
+
+
+def test_old_longform_record_without_target_uses_default_target():
+    settings = project_manager.normalize_longform_settings(
+        {"min_final_chars": 18_000, "max_final_chars": 88_000}
+    )
+
+    assert settings["target_final_chars"] == 22_000
 
 
 def test_longform_project_normalizes_rewrite_categories():
@@ -103,6 +114,52 @@ def test_episode_planner_never_cuts_a_chapter_to_reach_target_characters():
 
     assert [(episode["start_chapter"], episode["end_chapter"]) for episode in episodes] == [(1, 2), (3, 3)]
     assert warnings == []
+
+
+def test_episode_planner_chooses_complete_chapter_boundary_nearest_target():
+    chapters = [
+        NovelChapter(index=1, title="第1章", text="甲" * 10_000),
+        NovelChapter(index=2, title="第2章", text="乙" * 9_000),
+        NovelChapter(index=3, title="第3章", text="丙" * 8_000),
+    ]
+
+    episodes, warnings = pipeline_runner.plan_longform_episodes(
+        chapters,
+        min_final_chars=18_000,
+        target_final_chars=22_000,
+        max_final_chars=88_000,
+        minimum_rewrite_ratio=1.0,
+        count=1,
+    )
+
+    assert [(episode["start_chapter"], episode["end_chapter"]) for episode in episodes] == [(1, 2)]
+    assert warnings == []
+
+
+def test_episode_planner_forces_next_chapter_when_current_is_below_minimum():
+    chapters = [
+        NovelChapter(index=1, title="第1章", text="甲" * 12_000),
+        NovelChapter(index=2, title="第2章", text="乙" * 20_000),
+    ]
+
+    episodes, _ = pipeline_runner.plan_longform_episodes(
+        chapters,
+        min_final_chars=18_000,
+        target_final_chars=22_000,
+        max_final_chars=88_000,
+        minimum_rewrite_ratio=1.0,
+        count=1,
+    )
+
+    assert episodes[0]["end_chapter"] == 2
+
+
+def test_longform_settings_snapshot_includes_target_characters():
+    snapshot = pipeline_runner._longform_settings_snapshot(
+        {"min_final_chars": 18_000, "target_final_chars": 22_000, "max_final_chars": 88_000}
+    )
+
+    assert snapshot["target_final_chars"] == 22_000
 
 
 def test_queue_selector_keeps_next_episode_behind_earlier_batch_member(monkeypatch):

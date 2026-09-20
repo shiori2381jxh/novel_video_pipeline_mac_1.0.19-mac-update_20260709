@@ -4,6 +4,7 @@ import pytest
 
 from app import pipeline_runner
 from app.config import config
+from app.scrapers.base import Novel, NovelChapter
 
 
 class FakeLLM:
@@ -261,3 +262,69 @@ def test_reset_from_clean_removes_rewrite_localization_artifacts(monkeypatch, tm
         "text_rewrite_report.json",
     ):
         assert not (tmp_path / name).exists()
+
+
+def test_marketing_story_material_prefers_task_rewritten_text(tmp_path):
+    """A source-era marketing cache must not survive a rewritten name."""
+    novel = Novel(
+        site="local",
+        novel_id="novel-1",
+        title="测试小说",
+        chapters=[NovelChapter(index=1, title="第一章", text="林一在旧城区醒来。" * 200)],
+    )
+    rewritten = "沈川在旧城区醒来，发现同伴已经变成怪物。" * 200
+    (tmp_path / "text_rewritten.txt").write_text(rewritten, encoding="utf-8")
+
+    compact, expanded = pipeline_runner._marketing_story_material(
+        novel, [], tmp_path, 6000
+    )
+
+    assert "沈川" in compact
+    assert "沈川" in expanded
+    assert "林一" not in compact
+    assert "林一" not in expanded
+
+
+def test_marketing_story_material_uses_source_when_no_rewritten_text(tmp_path):
+    novel = Novel(
+        site="local",
+        novel_id="novel-1",
+        title="测试小说",
+        chapters=[NovelChapter(index=1, title="第一章", text="林一在旧城区醒来。" * 200)],
+    )
+
+    compact, expanded = pipeline_runner._marketing_story_material(
+        novel, [], tmp_path, 6000
+    )
+
+    assert "林一" in compact
+    assert "林一" in expanded
+
+
+def test_manual_cover_regeneration_revalidates_existing_marketing_cache(monkeypatch, tmp_path):
+    """A valid-looking metadata file cannot bypass rewritten-text cache checks."""
+    novel = Novel(
+        site="local",
+        novel_id="novel-1",
+        title="测试小说",
+        chapters=[NovelChapter(index=1, title="第一章", text="林一在旧城区醒来。")],
+    )
+    cover = tmp_path / "cover.jpg"
+    cover.write_bytes(b"cover")
+    refreshed_metadata = {"titles": ["沈川逃离旧城区。"] * 3, "synopses": ["简介"] * 2}
+    calls = []
+
+    monkeypatch.setattr(pipeline_runner, "is_worker_running", lambda _job_id: False)
+    monkeypatch.setattr(pipeline_runner, "_safe_job_path", lambda _job_id: tmp_path)
+    monkeypatch.setattr(pipeline_runner, "_read_saved_novel", lambda _path: novel)
+    monkeypatch.setattr(pipeline_runner, "_read_saved_segments", lambda _path: [])
+    monkeypatch.setattr(pipeline_runner, "_read_json", lambda path, default: {"titles": ["林一旧标题"] * 3, "synopses": ["旧简介"] * 2} if path.name == "metadata.json" else default)
+    monkeypatch.setattr(pipeline_runner, "_metadata_has_marketing_candidates", lambda _metadata: True)
+    monkeypatch.setattr(pipeline_runner, "stage_metadata", lambda *args, **kwargs: calls.append(args) or refreshed_metadata)
+    monkeypatch.setattr(pipeline_runner, "load_status", lambda *_args, **_kwargs: {"stage": "completed", "progress": 1.0})
+    monkeypatch.setattr(pipeline_runner, "write_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pipeline_runner, "stage_cover", lambda *args, **kwargs: cover)
+
+    pipeline_runner.regenerate_job_cover("job-1")
+
+    assert calls

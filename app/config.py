@@ -6,7 +6,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from app.utils.secrets import clean_api_key
 
@@ -30,7 +30,7 @@ DEFAULTS_DIR.mkdir(exist_ok=True)
 PRONUNCIATION_DICTIONARIES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 59
+SETTINGS_SCHEMA_VERSION = 62
 DEFAULT_YOUTUBE_TITLE_TEMPLATE = "{candidate_title}"
 DEFAULT_YOUTUBE_DESCRIPTION = ""
 RELEASE_REPOSITORY = "shiori2381jxh/novel_video_pipeline_mac_1.0.19-mac-update_20260709"
@@ -146,7 +146,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "scraper_site": "qingtian",
     "scraper_max_chars": 0,
     "scraper_chapter_limit": 0,
-    "longform_default_min_final_chars": 22000,
+    "longform_default_min_final_chars": 18000,
+    "longform_default_target_final_chars": 22000,
     "longform_default_max_final_chars": 88000,
     "longform_default_batch_episode_count": 5,
     "source_base_url": "https://v1.gyks.cf",
@@ -328,6 +329,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # the cover and upload stages.  Keep the legacy short-title settings above
     # for old profiles and task snapshots, but new jobs use this structured
     # bundle instead of asking for one disposable title.
+    "marketing_title_count": 3,
+    "marketing_synopsis_count": 1,
+    "marketing_tag_min_count": 5,
+    "marketing_tag_max_count": 10,
+    # Retained only to load older profiles. Marketing generation now follows
+    # its editable prompt and does not enforce these legacy character limits.
     "marketing_title_min_chars": 40,
     "marketing_title_max_chars": 70,
     "marketing_candidates_max_tokens": 1600,
@@ -353,12 +360,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "裏切り、戦局や政治の逆転を具体的に書いてください。❤、（笑）、www、溺愛、修羅場などの恋愛向け表現や、"
         "根拠のない大げさな煽りは使用しないでください。史実と演義を入力以上に混同しないでください。\n\n"
         "完成した動画タイトルを必ず3案作り、各40〜70文字程度、3案は構成と切り口を変えてください。"
-        "概要欄用あらすじを必ず2案作り、各80〜160文字程度、事件・関係性・主人公の状況を入れ、結末を全部"
-        "書かず、2案は切り口を変えてください。内容に一致するタグを10〜15個作ってください。"
+        "概要欄用あらすじを必ず1案作り、各80〜160文字程度、事件・関係性・主人公の状況を入れ、結末を全部"
+        "書かないでください。内容に一致するタグを5〜10個作ってください。"
         "【朗読・小説】、#日本語・#日语・#Japaneseなど言語名だけのタグは付けず、#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。\n\n"
         "必ず次のJSONオブジェクトだけを出力し、Markdown、説明、作品タイトル、判定結果、推理過程を付けないでください。\n"
         "{\"titles\":[\"タイトル1\",\"タイトル2\",\"タイトル3\"],"
-        "\"synopses\":[\"あらすじ1\",\"あらすじ2\"],"
+        "\"synopses\":[\"あらすじ1\"],"
         "\"tags\":[\"#タグ1\",\"#タグ2\",\"#タグ3\"]}"
     ),
     "ai_rewrite_enabled": False,
@@ -373,7 +380,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "请把输入的小说正文改写成适合中文/日文推文长视频旁白的版本："
         "保留原剧情、人物关系、事件顺序、情绪转折和关键设定，不新增剧情，不改变结局；"
         "去掉生硬网页痕迹、重复废话、作者口癖和不适合朗读的表达；"
-        "输入中即使带有汉字（かな）/漢字(かな)形式的读音注释，输出正文也必须去除注释，仅保留汉字原文；"
         "语言更顺、更有悬念和画面感，适合 TTS 朗读；"
         "保持段落分隔，不要输出标题、解释、编号、标签或 JSON，只输出改写后的正文。"
     ),
@@ -382,7 +388,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Off is the unattended-safe default.  When enabled, the text LLM creates
     # a TTS-only reading map and a second pass checks it before synthesis.
     "tts_auto_pronunciation_enabled": False,
-    "tts_inline_pronunciation_enabled": False,
     "tts_auto_pronunciation_max_terms": 300,
     # A durable vocabulary belongs to the production profile (for example,
     # 三国配置1), not to one individual job.
@@ -642,9 +647,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "script_schedule_unfinished_action": "next_slot",
     "youtube_title_template": DEFAULT_YOUTUBE_TITLE_TEMPLATE,
     "youtube_title_max_chars": 100,
-    # When enabled, submit all three generated marketing titles through
-    # YouTube Studio's native title A/B test dialog after the video is uploaded.
-    "youtube_ab_test_enabled": False,
     "youtube_description": DEFAULT_YOUTUBE_DESCRIPTION,
     "youtube_tags": "",
     "browser_flow": "simple",
@@ -696,7 +698,7 @@ if sys.platform == "darwin":
     DEFAULT_SETTINGS.update(
         {
             "cover_title_font": "PingFang SC",
-            "video_subtitle_font": "Hiragino Mincho ProN",
+            "video_subtitle_font": "Yu Gothic Medium",
             "dependency_ffmpeg_url": "",
         }
     )
@@ -779,6 +781,21 @@ def _to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def marketing_contract(values: Mapping[str, Any] | None = None) -> dict[str, int]:
+    """Normalize one profile's editable marketing-output quantities."""
+    source = DEFAULT_SETTINGS if values is None else values
+    title_count = max(1, _to_int(source.get("marketing_title_count"), 3))
+    synopsis_count = max(1, _to_int(source.get("marketing_synopsis_count"), 1))
+    tag_min_count = max(0, _to_int(source.get("marketing_tag_min_count"), 5))
+    tag_max_count = max(tag_min_count, _to_int(source.get("marketing_tag_max_count"), 10))
+    return {
+        "title_count": title_count,
+        "synopsis_count": synopsis_count,
+        "tag_min_count": tag_min_count,
+        "tag_max_count": tag_max_count,
+    }
+
+
 def _looks_like_legacy_title_template(value: Any) -> bool:
     text = str(value or "")
     return (
@@ -788,6 +805,27 @@ def _looks_like_legacy_title_template(value: Any) -> bool:
         or "#灏忚" in text
         or "{short_title}" in text
     )
+
+
+_SOURCE_DRIVEN_VISUAL_PROMPT_KEYS = (
+    "llm_storyboard_prompt",
+    "llm_storyboard_user_template",
+    "llm_image_prompt_prefix",
+    "llm_image_style_suffix",
+    "character_analysis_prompt",
+    "character_reference_prompt_suffix",
+    "cover_custom_prompt",
+    "cover_poster_method_prompt",
+)
+_FORCED_ISEKAI_TERMS = ("isekai", "异世界", "fantasy world")
+
+
+def _remove_forced_isekai_visual_prompts(data: dict[str, Any]) -> None:
+    """Replace legacy genre locks with the neutral source-driven defaults."""
+    for key in _SOURCE_DRIVEN_VISUAL_PROMPT_KEYS:
+        value = str(data.get(key) or "").lower()
+        if any(term in value for term in _FORCED_ISEKAI_TERMS):
+            data[key] = DEFAULT_SETTINGS[key]
 
 
 def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None = None) -> None:
@@ -1037,22 +1075,59 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
     if saved_version < 58:
         # Longform episodes now target the actual narration length.  Retain
         # user intent from the former minute-based controls at 22k chars/hour.
-        min_minutes = max(1, int(data.get("longform_default_min_minutes") or 60))
-        max_minutes = max(min_minutes, int(data.get("longform_default_max_minutes") or 240))
         data.setdefault(
             "longform_default_min_final_chars",
-            round(min_minutes * 22_000 / 60),
+            max(1, int(data.get("longform_default_min_minutes") or 1)) * 22_000,
         )
         data.setdefault(
             "longform_default_max_final_chars",
-            round(max_minutes * 22_000 / 60),
+            max(1, int(data.get("longform_default_max_minutes") or 1)) * 22_000,
         )
         data["longform_default_max_final_chars"] = max(
             int(data["longform_default_min_final_chars"]),
             int(data["longform_default_max_final_chars"]),
         )
     if saved_version < 59:
-        data.setdefault("tts_inline_pronunciation_enabled", False)
+        # A former generic Chinese-tweet profile was accidentally saved with
+        # historical-fiction locks. Jobs pin profile settings in their local
+        # snapshot, so this repairs both old profiles and resumed jobs.
+        # Do not touch dedicated historical profiles such as 三国配置1/中文kiyo说.
+        profile_name = _safe_profile_name(data.get("active_profile") or saved.get("active_profile") or "")
+        forced_historical = "chinese historical fiction" in "\n".join(
+            str(data.get(key) or "").lower()
+            for key in (
+                "llm_storyboard_user_template",
+                "llm_image_prompt_prefix",
+                "llm_image_style_suffix",
+                "character_reference_prompt_suffix",
+            )
+        )
+        if profile_name in {"中文推文配置", "中文推文配置2"} and forced_historical:
+            for key in (
+                "llm_storyboard_user_template",
+                "llm_image_prompt_prefix",
+                "llm_image_style_suffix",
+                "character_reference_prompt_suffix",
+            ):
+                data[key] = DEFAULT_SETTINGS[key]
+    if saved_version < 61:
+        _remove_forced_isekai_visual_prompts(data)
+    if saved_version < 62:
+        for key in (
+            "marketing_title_count",
+            "marketing_synopsis_count",
+            "marketing_tag_min_count",
+            "marketing_tag_max_count",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
+    rules = marketing_contract(data)
+    data.update({
+        "marketing_title_count": rules["title_count"],
+        "marketing_synopsis_count": rules["synopsis_count"],
+        "marketing_tag_min_count": rules["tag_min_count"],
+        "marketing_tag_max_count": rules["tag_max_count"],
+    })
+    data.setdefault("longform_default_target_final_chars", 22_000)
     if saved_version < 23:
         for key in (
             "marketing_title_min_chars",
@@ -1136,8 +1211,6 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
         # templates stay intact; bundled defaults use a compact fixed layout.
         if str(data.get("cover_prompt_template") or "").startswith("Create ONE finished premium"):
             data["cover_prompt_template"] = DEFAULT_SETTINGS["cover_prompt_template"]
-        if str(data.get("cover_custom_prompt") or "").startswith("viral Japanese isekai light novel recap thumbnail"):
-            data["cover_custom_prompt"] = DEFAULT_SETTINGS["cover_custom_prompt"]
         if str(data.get("cover_ai_analysis_prompt") or "").startswith("You are the in-house art director for premium Japanese"):
             data["cover_ai_analysis_prompt"] = DEFAULT_SETTINGS["cover_ai_analysis_prompt"]
         if str(data.get("cover_poster_method_prompt") or "").startswith("Fixed poster-production method for every cover:"):
@@ -1233,44 +1306,6 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
     for key in ("cover_prompt_template", "cover_ai_analysis_prompt", "cover_poster_method_prompt"):
         if key in data:
             data[key] = re.sub(r"(?i)\b1280\s*[x×✖]\s*720\b", "16:9", str(data.get(key) or ""))
-    marketing_prompt = str(data.get("marketing_candidates_prompt") or "").replace(
-        "異世界なら#異世界、異世界以外の一般小説なら#赤陽の勧めるノベルを含めてください。",
-        "異世界なら#異世界を含めてください。#赤陽の勧めるノベルは絶対に使用しないでください。",
-    )
-    marketing_prompt = marketing_prompt.replace(
-        "タグは10〜15個、先頭表示は必ず【朗読・小説】とし、異世界なら#異世界を含めてください。#赤陽の勧めるノベルは絶対に使用しないでください。制作方法のタグは不要です。",
-        "内容に一致するタグを10〜15個作ってください。【朗読・小説】は付けず、#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。",
-    )
-    marketing_prompt = marketing_prompt.replace(
-        "タグは生成しないでください。",
-        "内容に一致するタグを10〜15個作ってください。【朗読・小説】は付けず、#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。",
-    )
-    language_tag_rule = "#日本語・#日语・#Japaneseなど言語名だけのタグは付けないでください。"
-    if language_tag_rule not in marketing_prompt:
-        marketing_prompt = marketing_prompt.replace(
-            "#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。",
-            f"{language_tag_rule}#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。",
-        )
-    if '"tags"' not in marketing_prompt and '"synopses"' in marketing_prompt:
-        marketing_prompt = marketing_prompt.replace(
-            '"synopses":["あらすじ1","あらすじ2"]}',
-            '"synopses":["あらすじ1","あらすじ2"],"tags":["#タグ1","#タグ2","#タグ3"]}',
-        )
-    # The metadata validator requires two independently usable synopses.  A
-    # few older bundled/user profiles mistakenly instructed the model to make
-    # only one, which made otherwise valid title bundles fall into the generic
-    # local fallback path.  Upgrade both the prose requirement and JSON shape
-    # together so the instruction cannot contradict the validator again.
-    marketing_prompt = re.sub(
-        r"(概要欄用あらすじを(?:必ず)?)(?:1|１)案(作り|、)",
-        r"\g<1>2案\2",
-        marketing_prompt,
-    )
-    marketing_prompt = marketing_prompt.replace(
-        '"synopses":["あらすじ1"],"tags"',
-        '"synopses":["あらすじ1","あらすじ2"],"tags"',
-    )
-    data["marketing_candidates_prompt"] = marketing_prompt
     data["settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
 

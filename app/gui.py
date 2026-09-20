@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import json
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -35,7 +36,7 @@ from app import upload as browser_upload
 from app import script_publish_scheduler as publish_scheduler
 from app.api_probe import probe_image, probe_llm, probe_tts
 from app.autotune import run_startup_autotune
-from app.config import DATA_DIR, config
+from app.config import DATA_DIR, config, marketing_contract
 from app.config import API_KEY_FIELDS
 from app.version import VERSION
 from app.backends.tts import (
@@ -64,11 +65,7 @@ def _mousewheel_units(delta: int, platform: str) -> int:
     """Translate Tk mouse-wheel deltas into canvas scroll units."""
     if not delta:
         return 0
-    if platform == "darwin":
-        direction = -1 if delta > 0 else 1
-        steps = max(1, round(abs(delta) / 120)) if abs(delta) >= 120 else 1
-        return direction * min(steps, 3)
-    units = -int(delta / 120)
+    units = -delta if platform == "darwin" else -int(delta / 120)
     return units or (-1 if delta > 0 else 1)
 
 
@@ -584,9 +581,6 @@ class PipelineGUI:
         self._script_upload_running = False
         self._script_publish_paused = False
         self._active_browser_upload_jobs: dict[str, browser_upload._Job] = {}
-        # Incremented by “停止上传”. Batch workers capture this value so the
-        # button also prevents their not-yet-started items from uploading.
-        self._upload_stop_generation = 0
         self._image_failure_prompted: set[str] = set()
         # The task view is polled while a pipeline runs.  Keep a lightweight
         # filesystem fingerprint so an idle poll does not repeatedly parse
@@ -595,7 +589,6 @@ class PipelineGUI:
         # libraries.
         self._job_table_refresh_key = None
         self._next_category_table_refresh_at = 0.0
-        self._next_project_table_refresh_at = 0.0
         self._next_image_failure_scan_at = 0.0
         self._pronunciation_resolution_cache: dict[str, dict[str, str]] = {}
         self._edge_available_voices: set[str] | None = None
@@ -773,11 +766,16 @@ class PipelineGUI:
         import_row.pack(fill=tk.X)
         import_button = ttk.Button(
             import_row,
-            text="导入文件 / 文件夹…",
+            text="导入文件…",
             style="Primary.TButton",
             command=self._import_files_or_folders,
         )
         import_button.pack(side=tk.LEFT)
+        ttk.Button(
+            import_row,
+            text="导入文件夹…",
+            command=self._import_folder,
+        ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(
             import_row,
             text="TXT 加入长篇项目…",
@@ -798,11 +796,6 @@ class PipelineGUI:
             textvariable=self.pronunciation_dictionary_var,
             state="readonly",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
-        ttk.Label(
-            file_tab,
-            text="多音字可在正文直接写「汉字（ひらがな）」：仅 TTS 使用读音，字幕自动只显示汉字。",
-            foreground="#666",
-        ).pack(anchor=tk.W, pady=(3, 0))
 
         ttk.Separator(file_tab, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
         manual_row = ttk.Frame(file_tab)
@@ -996,7 +989,8 @@ class PipelineGUI:
         self._project_longform_section.pack(fill=tk.X, pady=(8, 0))
         longform_settings = self._project_longform_section.content
         self.project_longform_enabled_var = tk.BooleanVar(value=False)
-        self.project_longform_min_final_chars_var = tk.StringVar(value=str(config.get("longform_default_min_final_chars", 22000)))
+        self.project_longform_min_final_chars_var = tk.StringVar(value=str(config.get("longform_default_min_final_chars", 18000)))
+        self.project_longform_target_final_chars_var = tk.StringVar(value=str(config.get("longform_default_target_final_chars", 22000)))
         self.project_longform_max_final_chars_var = tk.StringVar(value=str(config.get("longform_default_max_final_chars", 88000)))
         self.project_longform_batch_count_var = tk.StringVar(value=str(config.get("longform_default_batch_episode_count", 5)))
         self.project_longform_name_memory_var = tk.BooleanVar(value=False)
@@ -1007,6 +1001,8 @@ class PipelineGUI:
         ttk.Checkbutton(longform_row, text="启用按字数连续分集", variable=self.project_longform_enabled_var).pack(side=tk.LEFT)
         ttk.Label(longform_row, text="洗稿后最少字数").pack(side=tk.LEFT, padx=(16, 4))
         ttk.Entry(longform_row, textvariable=self.project_longform_min_final_chars_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(longform_row, text="目标字数").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(longform_row, textvariable=self.project_longform_target_final_chars_var, width=8).pack(side=tk.LEFT)
         ttk.Label(longform_row, text="最多字数").pack(side=tk.LEFT, padx=(10, 4))
         ttk.Entry(longform_row, textvariable=self.project_longform_max_final_chars_var, width=8).pack(side=tk.LEFT)
         ttk.Label(longform_row, text="本轮集数").pack(side=tk.LEFT, padx=(10, 4))
@@ -1018,7 +1014,7 @@ class PipelineGUI:
         ttk.Label(longform_flags, text="替换类别").pack(side=tk.LEFT, padx=(16, 4))
         ttk.Entry(longform_flags, textvariable=self.project_longform_rewrite_categories_var, width=24).pack(side=tk.LEFT)
         ttk.Label(longform_settings, text="例如：人名、地名；仅替换填写的类别，城市名/地点按地名处理。", foreground="#666").pack(anchor=tk.W, pady=(5, 0))
-        ttk.Label(longform_settings, text="洗稿后不足最少字数会自动追加完整章节；单章超长会保留完整并提示。", foreground="#666").pack(anchor=tk.W, pady=(5, 0))
+        ttk.Label(longform_settings, text="优先接近目标字数；最少/最多字数仅兜底，不会拆分章节。", foreground="#666").pack(anchor=tk.W, pady=(5, 0))
         longform_actions = ttk.Frame(longform_settings)
         longform_actions.pack(fill=tk.X, pady=(6, 0))
         ttk.Button(longform_actions, text="保存长篇设置", command=self._save_current_project_series_settings).pack(side=tk.LEFT)
@@ -1213,21 +1209,11 @@ class PipelineGUI:
         queue_pane.pack(fill=tk.BOTH, expand=True)
 
         toolbar_box = ttk.Frame(queue_pane, padding=4)
-        self.job_selection_count_var = tk.StringVar(value="已选中 0 个任务")
-        ttk.Label(
-            toolbar_box,
-            textvariable=self.job_selection_count_var,
-            font=(UI_FONT, UI_SMALL_FONT_SIZE, "bold"),
-            foreground="#1f5f91",
-        ).pack(anchor=tk.W, padx=4, pady=(0, 3))
-        action_bar = ttk.Frame(toolbar_box)
-        action_bar.pack(fill=tk.X)
-        ttk.Button(action_bar, text="启动", command=self._start_jobs, style="Primary.TButton").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(action_bar, text="清空已结束任务", command=self._delete_finished_jobs).pack(side=tk.LEFT)
-        ttk.Button(action_bar, text="停止", command=self._stop_jobs).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(action_bar, text="停止上传", command=self._stop_all_uploads).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(toolbar_box, text="启动", command=self._start_jobs, style="Primary.TButton").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(toolbar_box, text="清空已结束任务", command=self._delete_finished_jobs).pack(side=tk.LEFT)
+        ttk.Button(toolbar_box, text="停止", command=self._stop_jobs).pack(side=tk.LEFT, padx=(6, 0))
 
-        cols = ("job_id", "stage", "short", "progress", "worker", "audio", "dictionary", "title", "video", "schedule", "youtube")
+        cols = ("job_id", "stage", "short", "progress", "worker", "audio", "dictionary", "title", "video", "scheduled_at", "youtube")
         tree_box = ttk.Frame(queue_pane)
         queue_pane.add(toolbar_box, weight=0)
         queue_pane.add(tree_box, weight=1)
@@ -1255,7 +1241,7 @@ class PipelineGUI:
             "dictionary": "读音词典",
             "title": "标题",
             "video": "视频",
-            "schedule": "预约时间",
+            "scheduled_at": "预约时间",
             "youtube": "YouTube",
         }
         widths = {
@@ -1268,7 +1254,7 @@ class PipelineGUI:
             "dictionary": 82,
             "title": 130,
             "video": 140,
-            "schedule": 88,
+            "scheduled_at": 92,
             "youtube": 140,
         }
         min_widths = {
@@ -1281,7 +1267,7 @@ class PipelineGUI:
             "dictionary": 58,
             "title": 60,
             "video": 60,
-            "schedule": 72,
+            "scheduled_at": 72,
             "youtube": 60,
         }
         saved_widths = config.get("job_table_column_widths", {})
@@ -1327,6 +1313,12 @@ class PipelineGUI:
             ("预备分模式", self._prepare_selected_jobs_for_preliminary_scoring),
         ):
             self.job_context_menu.add_command(label=label, command=command)
+        self.job_context_menu.add_command(
+            label="将 YouTube 状态改为上传成功",
+            command=self._mark_selected_jobs_youtube_uploaded,
+            state=tk.DISABLED,
+        )
+        self._youtube_mark_uploaded_menu_index = self.job_context_menu.index(tk.END)
         self.job_schedule_menu = tk.Menu(self.job_context_menu, tearoff=False)
         self.job_schedule_menu.add_command(label="1.油管内定时", command=self._schedule_selected_jobs_on_youtube)
         self.job_schedule_menu.add_command(label="3.脚本内定时", command=self._schedule_selected_jobs_in_script)
@@ -1347,12 +1339,6 @@ class PipelineGUI:
         self.job_context_menu.add_cascade(label="重试", menu=self.job_retry_menu)
         self.job_context_menu.add_separator()
         self.job_context_menu.add_command(
-            label="将 YouTube 状态改为上传成功",
-            command=self._mark_selected_jobs_youtube_uploaded,
-        )
-        self._mark_youtube_uploaded_menu_index = self.job_context_menu.index(tk.END)
-        self.job_context_menu.add_separator()
-        self.job_context_menu.add_command(
             label="加入小说项目…",
             command=self._assign_selected_jobs_to_project_dialog,
         )
@@ -1366,13 +1352,6 @@ class PipelineGUI:
         self.job_context_menu.add_command(label="刷新", command=self._refresh_jobs)
         self._job_tree_hscroll = tree_hscroll
         self._job_tree_vscroll = tree_vscroll
-
-    def _update_job_selection_count(self):
-        """Reflect the current multi-selection beside the task queue actions."""
-        if not hasattr(self, "job_selection_count_var"):
-            return
-        count = len(self.job_tree.selection())
-        self.job_selection_count_var.set(f"已选中 {count} 个任务")
 
     def _build_right_panel(self, parent):
         notebook = ttk.Notebook(parent)
@@ -1422,12 +1401,6 @@ class PipelineGUI:
         # here.  Keeping this widget outside the canvas makes it genuinely
         # fixed while the settings body scrolls.
         sticky_header = ttk.Frame(scroll_area, relief=tk.RIDGE, borderwidth=1, padding=(9, 5))
-        sticky_profile = ttk.Label(
-            sticky_header,
-            font=(UI_FONT, UI_SMALL_FONT_SIZE, "bold"),
-            foreground="#1f5f91",
-        )
-        sticky_profile.pack(side=tk.LEFT, padx=(0, 8))
         sticky_title = ttk.Label(
             sticky_header,
             font=(UI_FONT, UI_HEADING_FONT_SIZE, "bold"),
@@ -1439,16 +1412,6 @@ class PipelineGUI:
         sticky_state: dict[str, dict | None] = {"section": None}
         body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
         body_window = canvas.create_window((0, 0), window=body, anchor="nw")
-
-        def update_sticky_profile_name(*_args):
-            """Keep the pinned section header explicit about its profile."""
-            profile_var = getattr(self, "profile_var", None)
-            profile_name = str(
-                profile_var.get() if profile_var is not None else config.get("active_profile", "配置1")
-            ).strip() or "配置1"
-            sticky_profile.configure(text=f"方案：{profile_name}")
-
-        update_sticky_profile_name()
 
         def update_sticky_header():
             """Show the current settings section title at the top while scrolling."""
@@ -1472,9 +1435,13 @@ class PipelineGUI:
                 sticky_state["section"] = None
                 return
             sticky_state["section"] = current
-            sticky_title.configure(text=current["title"])
+            sticky_title.configure(
+                text=f"方案：{config.get('active_profile', '配置1')}　{current['title']}"
+            )
             sticky_arrow.configure(text="▼" if current["expanded"] else "▶")
             sticky_header.place(x=0, y=0, width=canvas.winfo_width())
+
+        self._update_config_sticky_header = update_sticky_header
 
         def on_canvas_configure(event):
             canvas.itemconfigure(body_window, width=event.width)
@@ -1575,7 +1542,6 @@ class PipelineGUI:
                 return "break"
 
             sticky_header.bind("<Button-1>", toggle_sticky)
-            sticky_profile.bind("<Button-1>", toggle_sticky)
             sticky_title.bind("<Button-1>", toggle_sticky)
             sticky_arrow.bind("<Button-1>", toggle_sticky)
             if expanded:
@@ -1797,10 +1763,6 @@ class PipelineGUI:
         # Without this binding, only the displayed name changes while all form
         # fields (and the configuration used for a run) remain from the prior profile.
         self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
-        # The sticky header remains visible while editing deep sections such
-        # as batching and uploads, so update it immediately on every profile
-        # switch (including task-selection driven switches).
-        self.profile_var.trace_add("write", update_sticky_profile_name)
 
         section("系统与依赖")
         check("启动时检测依赖", "dependency_check_on_startup")
@@ -2036,6 +1998,9 @@ class PipelineGUI:
             "<<ComboboxSelected>>", lambda _event: self._refresh_tts_voice_options(), add="+"
         )
         self._refresh_tts_voice_options()
+        update_sticky = getattr(self, "_update_config_sticky_header", None)
+        if update_sticky is not None:
+            self.root.after_idle(update_sticky)
         row("语速", "tts_rate", "+0%")
         row("音量倍率", "tts_volume", "1.0")
         section_model_combo("TTS 模型名", "tts_model", "tts-1", ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"])
@@ -2115,14 +2080,12 @@ class PipelineGUI:
         section("自动 TTS 读音审校")
         ttk.Label(
             section_parent,
-            text="AI 会把全文分段送入文本 API，再进行第二轮复核。词典模式只处理易错词；正文标注模式会要求覆盖所有含汉字的词语，并写成「汉字（かな）」，字幕自动隐藏括号内容。",
+            text="开启后会按下方可编辑提示词自动生成读音词典：第一轮从全文提取，第二轮复核；在 TTS 前自动套用。仅修改 Edge / VOICEVOX 的朗读稿，字幕和原文不变。",
             foreground="#666",
             wraplength=520,
         ).pack(anchor=tk.W, pady=(0, 4))
         check("自动生成读音词典并双重审校（TTS 前执行，会增加文本 API 用量）", "tts_auto_pronunciation_enabled")
-        check("自动标注整篇正文所有汉字读音「汉字（かな）」（字幕不显示括号内容）", "tts_inline_pronunciation_enabled")
-        ttk.Label(section_parent, text="只开启这一项即可；无需开启自动生成词典。程序会单独触发同一次两轮 AI 审校，正文标注不受下方词条上限限制。", foreground="#666", wraplength=520).pack(anchor=tk.W, pady=(0, 4))
-        row("词典模式每篇最多采用读音词条", "tts_auto_pronunciation_max_terms", "300")
+        row("每篇最多采用读音词条", "tts_auto_pronunciation_max_terms", "300")
         textrow(
             "第一轮读音提取提示词",
             "pronunciation_dictionary_prompt",
@@ -2361,8 +2324,10 @@ class PipelineGUI:
         section("批量与上传")
         synced_check("检测系列动画", "series_animation_enabled")
         check("自动生成标题/概梗候选", "short_title_enabled")
-        row("候选标题最少字", "marketing_title_min_chars", "40")
-        row("候选标题最多字", "marketing_title_max_chars", "70")
+        row("候选标题数量", "marketing_title_count", "3")
+        row("候选概要数量", "marketing_synopsis_count", "1")
+        row("候选标签最少数量", "marketing_tag_min_count", "5")
+        row("候选标签最多数量", "marketing_tag_max_count", "10")
         row("标题接口重试次数", "marketing_candidates_retry_attempts", "5")
         row("标题接口重试等待秒", "marketing_candidates_retry_delay_seconds", "60")
         textrow("标题/概梗提示词（可编辑）", "marketing_candidates_prompt", str(config.get("marketing_candidates_prompt", "")), height=7)
@@ -2385,7 +2350,6 @@ class PipelineGUI:
         textrow("高级: 方案 JSON", "browser_profiles", str(config.get("browser_profiles", "[]")), height=5)
         row("上传标题模板", "youtube_title_template", "{candidate_title}")
         row("上传标题字数", "youtube_title_max_chars", "100")
-        check("启用 YouTube 标题 A/B 测试（提交全部 3 个候选标题）", "youtube_ab_test_enabled")
         textrow("说明模板", "youtube_description", "", height=4)
         row("模板 Tags（仅 {tags} 使用）", "youtube_tags", "")
         row("上传政策", "browser_upload_policy", "BTRA")
@@ -2395,7 +2359,7 @@ class PipelineGUI:
 
         ttk.Label(
             section_parent,
-            text="普通上传会从3个候选标题中随机选择；启用标题 A/B 测试时会提交全部 3 个候选标题。标题会先按上传标题模板生成；若仍有字数空间，再补入模板中没有的内容标签。脚本绝不会自动加【朗读・小説】。{tags} 只引用“模板 Tags”。simple=无创收精简流程，full=完整创收/广告/分级流程。",
+            text="新任务上传时会从当前方案生成的候选标题中随机选择，并先按上传标题模板生成；若仍有字数空间，再补入模板中没有的内容标签。脚本绝不会自动加【朗读・小説】。{tags} 只引用“模板 Tags”。simple=无创收精简流程，full=完整创收/广告/分级流程。",
             foreground="#666",
             wraplength=520,
         ).pack(anchor=tk.W, pady=(4, 14))
@@ -2499,7 +2463,8 @@ class PipelineGUI:
             "video_subtitle_size", "video_subtitle_margin_v", "video_subtitle_margin_lr",
             "video_subtitle_chars_per_line", "video_subtitle_max_lines",
             "short_title_min_chars", "short_title_max_chars",
-            "marketing_title_min_chars", "marketing_title_max_chars", "youtube_title_max_chars",
+            "marketing_title_count", "marketing_synopsis_count",
+            "marketing_tag_min_count", "marketing_tag_max_count", "youtube_title_max_chars",
             "script_schedule_interval_hours",
             "short_video_duration_seconds", "short_video_width", "short_video_height",
             "short_video_script_min_seconds", "short_video_script_max_seconds",
@@ -2530,7 +2495,7 @@ class PipelineGUI:
             "storyboard_highlight_enabled", "storyboard_highlight_align_timeline",
             "scene_reference_enabled", "ai_api_enabled",
             "tts_retry_until_success", "tts_waveform_validation", "tts_subprocess_isolation",
-            "tts_clean_rewritten_text", "tts_auto_pronunciation_enabled", "tts_inline_pronunciation_enabled",
+            "tts_clean_rewritten_text", "tts_auto_pronunciation_enabled",
             "tts_profile_pronunciation_enabled", "tts_profile_pronunciation_auto_learn",
             "pronunciation_dictionary_dedicated_api_enabled",
             "hardware_autotune_enabled",
@@ -2579,6 +2544,16 @@ class PipelineGUI:
         config.set("video_subtitle", True)
         if "video_subtitle" in self.vars:
             self.vars["video_subtitle"].set("开启")
+        contract = marketing_contract(config.as_dict())
+        for key, value in (
+            ("marketing_title_count", contract["title_count"]),
+            ("marketing_synopsis_count", contract["synopsis_count"]),
+            ("marketing_tag_min_count", contract["tag_min_count"]),
+            ("marketing_tag_max_count", contract["tag_max_count"]),
+        ):
+            config.set(key, value)
+            if key in self.vars:
+                self.vars[key].set(str(value))
         profile_var = getattr(self, "profile_var", None)
         profile_name = str(profile_var.get() if profile_var is not None else "配置1").strip() or "配置1"
         config.set("active_profile", profile_name)
@@ -4432,36 +4407,36 @@ class PipelineGUI:
             )
 
     def _create_jobs_from_preliminary_packages(self, packages: list[dict]) -> tuple[int, list[str]]:
-        """Create fresh jobs from preliminary packages, reusing audio when available."""
+        """Create fresh imported-audio jobs from validated preliminary packages."""
         created = 0
         errors: list[str] = []
         for package in packages:
-            job_id = ""
             try:
-                create_kwargs = {}
-                if package.get("audio_path"):
-                    create_kwargs["imported_audio_path"] = str(package["audio_path"])
                 job_id = self._create_queued_job(
-                    str(package["title"]), str(package["text_path"]), **create_kwargs
+                    str(package["title"]),
+                    str(package["text_path"]),
+                    imported_audio_path=str(package["audio_path"]),
                 )
-                if job_id:
+                if not job_id:
+                    continue
+                try:
                     job_dir = pr.job_dir_for(job_id)
                     for name, source in dict(package.get("reusable_json") or {}).items():
-                        if name in pr.PRELIMINARY_REUSABLE_JSON_FILES:
-                            shutil.copy2(Path(source), job_dir / name)
-                    pr.append_log(
-                        job_dir,
-                        "preliminary package: restored reusable text/story/character JSON; "
-                        f"{'reusing saved main audio and skipping TTS' if package.get('audio_path') else 'main audio unavailable; TTS will regenerate'}; "
-                        "titles, image prompts, images and video will regenerate",
-                    )
-                created += int(bool(job_id))
-            except Exception as exc:
-                if job_id:
+                        shutil.copy2(Path(source), job_dir / name)
+                    if package.get("reusable_json"):
+                        pr.append_log(
+                            job_dir,
+                            "preliminary package: restored reusable text/story/character JSON; "
+                            "titles, image prompts, images and video will regenerate",
+                        )
+                except Exception:
                     try:
                         pr.delete_job(job_id)
                     except Exception:
                         pass
+                    raise
+                created += 1
+            except Exception as exc:
                 package_dir = Path(package.get("package_dir") or "预备分包")
                 errors.append(f"{package_dir.name}: {exc}")
         return created, errors
@@ -4487,7 +4462,7 @@ class PipelineGUI:
             if preliminary_created:
                 messagebox.showinfo(
                     "预备分包已导入",
-                    f"已新建 {preliminary_created} 个任务。含正片音频的任务将跳过 TTS；其余任务会重做配音、图片和正片。",
+                    f"已新建 {preliminary_created} 个任务。开始任务后会调用图片 API 重新生图并合成正片。",
                 )
             return
         explicit_files = [path for path in selected if path.is_file()]
@@ -4741,7 +4716,7 @@ class PipelineGUI:
             if preliminary_created:
                 messagebox.showinfo(
                     "预备分包已导入",
-                    f"已新建 {preliminary_created} 个任务。含正片音频的任务将跳过 TTS；其余任务会重做配音、图片和正片。",
+                    f"已新建 {preliminary_created} 个任务。开始任务后会调用图片 API 重新生图并合成正片。",
                 )
             return
 
@@ -5118,20 +5093,6 @@ class PipelineGUI:
             content = editor.get("1.0", tk.END).strip()
             try:
                 entries = pr.parse_pronunciation_dictionary(content)
-            except pr.PronunciationDictionaryConflictError as exc:
-                # Reusable dictionaries are often assembled from several jobs.
-                # Do not make the operator hunt down every repeated written form:
-                # reuse the task-level chooser and persist its normalized result.
-                # A global dictionary can only have one reading per written form,
-                # so the selected reading is deliberately written back as one line.
-                selected = self._choose_pronunciation_conflicts(exc.conflicts)
-                if selected is None:
-                    return
-                try:
-                    entries = pr.parse_pronunciation_dictionary(content, conflict_choices=selected)
-                except Exception as resolve_exc:
-                    messagebox.showerror("词库格式无效", str(resolve_exc), parent=dialog)
-                    return
             except Exception as exc:
                 messagebox.showerror("词库格式无效", str(exc), parent=dialog)
                 return
@@ -5317,6 +5278,27 @@ class PipelineGUI:
         # visible column is abbreviated for readability.
         return [str(iid) for iid in self.job_tree.selection()]
 
+    def _mark_selected_jobs_youtube_uploaded(self):
+        """Persist an operator-confirmed upload success for selected tasks."""
+        ids = self._selected_job_ids()
+        if not ids:
+            return
+        errors: list[str] = []
+        for job_id in ids:
+            try:
+                job_dir = pr.job_dir_for(job_id)
+                pr.write_status(
+                    job_dir,
+                    youtube_manually_marked_uploaded=True,
+                    upload_error="",
+                )
+                pr.append_log(job_dir, "YouTube manually marked uploaded by user")
+            except Exception as exc:
+                errors.append(f"{job_id}: {exc}")
+        self._refresh_jobs()
+        if errors:
+            messagebox.showerror("更新 YouTube 状态失败", "\n".join(errors))
+
     def _show_job_context_menu(self, event):
         """Select the clicked row (without losing a multi-selection) and show actions."""
         if self.job_tree.identify_region(event.x, event.y) == "heading":
@@ -5328,34 +5310,20 @@ class PipelineGUI:
         if row_id not in self.job_tree.selection():
             self.job_tree.selection_set(row_id)
         self.job_tree.focus(row_id)
-        clicked_column = self.job_tree.identify_column(event.x)
-        display_columns = list(self.job_tree["displaycolumns"])
-        if display_columns == ["#all"]:
-            display_columns = list(self._job_table_columns)
-        try:
-            column_name = display_columns[int(clicked_column.removeprefix("#")) - 1]
-        except (ValueError, IndexError):
-            column_name = ""
         self.job_context_menu.entryconfigure(
-            self._mark_youtube_uploaded_menu_index,
-            state=tk.NORMAL if column_name == "youtube" else tk.DISABLED,
+            self._youtube_mark_uploaded_menu_index,
+            state=tk.NORMAL if self._is_youtube_context_column(event) else tk.DISABLED,
         )
         self.job_context_menu.tk_popup(event.x_root, event.y_root)
         return "break"
 
-    def _mark_selected_jobs_youtube_uploaded(self):
-        """Persist an operator-confirmed YouTube success for selected queue rows."""
-        job_ids = self._selected_job_ids()
-        if not job_ids:
-            return
-        for job_id in job_ids:
-            pr.write_status(
-                pr.job_dir_for(job_id),
-                youtube_manually_marked_uploaded=True,
-                upload_error="",
-            )
-            pr.append_log(pr.job_dir_for(job_id), "YouTube upload marked successful manually by operator")
-        self._refresh_jobs(force=True)
+    def _is_youtube_context_column(self, event) -> bool:
+        """Whether a queue context click originated from the YouTube column."""
+        column = self.job_tree.identify_column(event.x)
+        try:
+            return str(self.job_tree.column(column, "id") or "") == "youtube"
+        except tk.TclError:
+            return False
 
     def _job_table_layout(self) -> tuple[list[str], list[str]]:
         """Return validated column order and the subset currently displayed."""
@@ -5365,17 +5333,11 @@ class PipelineGUI:
         order.extend(column for column in columns if column not in order)
         raw_visible = config.get("job_table_visible_columns", [])
         visible = [column for column in raw_visible if column in order] if isinstance(raw_visible, list) else []
-        # Add the appointment column to existing saved layouts immediately to
-        # the left of YouTube.  Once it has entered the saved order, normal
-        # column visibility controls remain authoritative (including hiding it).
-        has_saved_schedule = isinstance(raw_order, list) and "schedule" in raw_order
-        if not has_saved_schedule:
-            order.remove("schedule")
-            youtube_index = order.index("youtube") if "youtube" in order else len(order)
-            order.insert(youtube_index, "schedule")
-            if visible:
-                youtube_index = visible.index("youtube") if "youtube" in visible else len(visible)
-                visible.insert(youtube_index, "schedule")
+        # Older saved layouts predate the appointment column.  Insert it at
+        # the expected position without discarding an operator's other order.
+        for layout in (order, visible):
+            if "scheduled_at" not in layout and "youtube" in layout:
+                layout.insert(layout.index("youtube"), "scheduled_at")
         # An empty saved value is the default, rather than an intentionally
         # empty table.  The latter would leave no way to operate the queue.
         if not visible:
@@ -5483,17 +5445,54 @@ class PipelineGUI:
             return None
         return ids[0]
 
+    def _bind_unassigned_jobs_before_start(self, job_ids: list[str]) -> bool:
+        """Require a durable configuration snapshot before dispatching new work."""
+        missing = [
+            job_id for job_id in job_ids
+            if job_id and not str(pr.load_status(job_id, include_worker=False).get("assigned_profile") or "").strip()
+        ]
+        if not missing:
+            return True
+        profiles = config.list_profiles()
+        if not profiles:
+            messagebox.showerror("没有可用配置", "请先创建并保存一个流水线配置方案。")
+            return False
+        selected = str(config.get("active_profile", "") or "").strip()
+        selected = selected if selected in profiles else profiles[0]
+        choice = {"value": ""}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("未绑定流水线配置")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=14)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text=f"有 {len(missing)} 个待启动任务尚未绑定配置。\n请选择方案后“套用并启动”。").pack(anchor=tk.W)
+        variable = tk.StringVar(value=selected)
+        ttk.Combobox(body, textvariable=variable, values=profiles, state="readonly", width=32).pack(fill=tk.X, pady=(10, 12))
+        actions = ttk.Frame(body)
+        actions.pack(fill=tk.X)
+        ttk.Button(actions, text="暂不执行", command=dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(actions, text="套用并启动", style="Primary.TButton", command=lambda: (choice.__setitem__("value", variable.get()), dialog.destroy())).pack(side=tk.RIGHT, padx=(0, 6))
+        dialog.grab_set()
+        dialog.wait_window()
+        if not choice["value"]:
+            return False
+        try:
+            pr.apply_profile_to_jobs(missing, choice["value"])
+            config.load_profile(choice["value"])
+            self.profile_var.set(choice["value"])
+            self._refresh_config_form()
+            return True
+        except Exception as exc:
+            messagebox.showerror("套用方案失败", str(exc))
+            return False
+
     def _start_selected(self):
         ids = self._selected_job_ids()
         if not ids:
             messagebox.showwarning("没有选择任务", "请先选择要启动的任务。")
             return
-        startable = [
-            job_id for job_id in ids
-            if not pr.load_status(job_id, include_worker=False).get("worker_alive")
-            and str(pr.load_status(job_id, include_worker=False).get("input") or "").strip()
-        ]
-        if startable and not self._choose_profile_for_unassigned_jobs(startable):
+        if not self._bind_unassigned_jobs_before_start(ids):
             return
         if len(ids) == 1:
             self._start_job(ids[0], selected_job_ids=ids)
@@ -6269,10 +6268,10 @@ class PipelineGUI:
                 )
             elif mode and scheduled_at:
                 reminders.append(f"{job_id}：{'油管内定时' if mode == 'youtube' else '脚本内定时'} {scheduled_at.replace('T', ' ')}")
-            elif youtube_url:
-                reminders.append(f"{job_id}：已经上传 {youtube_url}")
             elif bool(status.get("youtube_manually_marked_uploaded")):
                 reminders.append(f"{job_id}：已手动标记为上传成功")
+            elif youtube_url:
+                reminders.append(f"{job_id}：已经上传 {youtube_url}")
             upload_result = pr.job_dir_for(job_id) / "upload_result.json"
             if upload_result.exists():
                 try:
@@ -6389,13 +6388,9 @@ class PipelineGUI:
                 })
             pr.write_status(pr.job_dir_for(job_id), **status_updates)
 
-        upload_generation = self._upload_stop_generation
-
         def worker():
             errors = []
             for job_id, target in zip(ids, scheduled_rows):
-                if upload_generation != self._upload_stop_generation:
-                    break
                 main_done = not publish_main
                 short_done = not publish_short
                 try:
@@ -6459,8 +6454,6 @@ class PipelineGUI:
                         updates["short_upload_error"] = str(exc)
                     pr.write_status(pr.job_dir_for(job_id), **updates)
                     errors.append(f"{job_id}: {exc}")
-                    if upload_generation != self._upload_stop_generation:
-                        break
             self.root.after(0, lambda: self._finish_combined_schedule(ids, errors, publish_main, publish_short))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -6543,13 +6536,9 @@ class PipelineGUI:
         ):
             return
 
-        upload_generation = self._upload_stop_generation
-
         def worker():
             errors = []
             for job_id, target, profile_name, configuration_name, main_title in entries:
-                if upload_generation != self._upload_stop_generation:
-                    break
                 upload_job = browser_upload._Job()
                 self._active_browser_upload_jobs[f"short:{job_id}"] = upload_job
                 try:
@@ -6571,8 +6560,6 @@ class PipelineGUI:
                 finally:
                     if self._active_browser_upload_jobs.get(f"short:{job_id}") is upload_job:
                         self._active_browser_upload_jobs.pop(f"short:{job_id}", None)
-                if upload_generation != self._upload_stop_generation:
-                    break
             self.root.after(0, lambda: self._finish_short_schedule(entries, errors))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -6700,13 +6687,9 @@ class PipelineGUI:
         if not messagebox.askyesno(confirm_title, confirm_text):
             return
 
-        upload_generation = self._upload_stop_generation
-
         def worker():
             errors = []
             for job_id in ids:
-                if upload_generation != self._upload_stop_generation:
-                    break
                 upload_job = browser_upload._Job()
                 self._active_browser_upload_jobs[job_id] = upload_job
                 try:
@@ -6723,8 +6706,6 @@ class PipelineGUI:
                 finally:
                     if self._active_browser_upload_jobs.get(job_id) is upload_job:
                         self._active_browser_upload_jobs.pop(job_id, None)
-                if upload_generation != self._upload_stop_generation:
-                    break
             self.root.after(0, lambda: self._finish_manual_upload(ids, errors, scheduled=schedule_enabled))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -6819,6 +6800,14 @@ class PipelineGUI:
         else:
             messagebox.showinfo("Short生成完成", f"已为 {len(completed)} 个选中任务生成Short视频。")
 
+    @staticmethod
+    def _marketing_regeneration_message(contract: dict[str, int]) -> str:
+        return (
+            "将使用当前设置，为选中的 {count} 个任务重新生成 "
+            f"{contract['title_count']} 个标题、{contract['synopsis_count']} 个概梗和 "
+            f"{contract['tag_min_count']}–{contract['tag_max_count']} 个内容标签。"
+        )
+
     def _regenerate_selected_marketing(self):
         ids = self._selected_job_ids()
         if not ids:
@@ -6830,7 +6819,7 @@ class PipelineGUI:
             return
         if not messagebox.askyesno(
             "重新生成标题概梗",
-            f"将使用当前设置，为选中的 {len(ids)} 个任务重新生成 3 个标题、2 个概梗和内容标签。\n\n"
+            self._marketing_regeneration_message(marketing_contract(config.as_dict())).format(count=len(ids)) + "\n\n"
             "封面、配音、剧情图、字幕和成片均不会改变；下次上传会从新标题中重新选择。继续吗？",
         ):
             return
@@ -6955,22 +6944,16 @@ class PipelineGUI:
         self._refresh_jobs()
 
     def _start_all_pending(self):
-        candidates = []
-        for row in pr.list_jobs(limit=500):
-            job_id = str(row.get("job_id") or "")
-            status = row.get("_status") if isinstance(row.get("_status"), dict) else pr.load_status(job_id, include_worker=False)
-            if (
-                job_id
-                and not status.get("worker_alive")
-                and status.get("stage") in {"pending", "queued", "failed"}
-                and str(status.get("input") or "").strip()
-            ):
-                candidates.append(job_id)
-        if candidates and not self._choose_profile_for_unassigned_jobs(candidates):
-            return
         try:
             # Save once before dispatching the batch.  The workers then retain
             # this configuration in their normal per-job snapshots.
+            pending = [
+                str(row.get("job_id") or "")
+                for row in pr.list_jobs(limit=10000)
+                if str(row.get("stage") or "") in {"pending", "queued", "stopped", "preprocessed"}
+            ]
+            if not self._bind_unassigned_jobs_before_start(pending):
+                return
             self._apply_config_form(save_profile=False)
             queued, started = pr.queue_all_pending_jobs()
         except Exception as exc:
@@ -6990,8 +6973,6 @@ class PipelineGUI:
     def _start_job(self, job_id: str, selected_job_ids: list[str] | None = None):
         st = pr.load_status(job_id)
         if st.get("worker_alive"):
-            return
-        if not self._choose_profile_for_unassigned_jobs([job_id]):
             return
         info = pr.series_start_choice_info(job_id, selected_job_ids or [job_id])
         if info:
@@ -7068,10 +7049,8 @@ class PipelineGUI:
         running = [job_id for job_id in ids if pr.is_worker_running(job_id)]
         message = (
             f"将把 {len(ids)} 个任务整理为预备分包，不保留任何 MP4。\n\n"
-            "保留原文、图片/封面留档、Short 非视频资料，以及正文分段、故事背景和人物设定 JSON；存在的正片音频也会保留。\n"
-            "以后可从“导入文件 / 文件夹”选择该预备分包：有正片音频的任务跳过 TTS；没有的任务会重新配音。标题、配图和视频都会重新制作。\n\n"
-            "其余文件（包括状态、字幕、分镜、日志和可续跑数据）会永久删除，任务无法再从此目录继续运行。\n"
-            "整理后的目录会放入 data/预备分，并命名为“预备分_原任务名”。"
+            "保留原文、正片音频、图片/封面留档、Short 非视频资料，以及正文分段、故事背景和人物设定 JSON。\n"
+            "以后可从“导入文件 / 文件夹”选择该预备分包，快速恢复脚本数据；标题、配图和视频会重新制作。"
         )
         if running:
             message += f"\n\n其中 {len(running)} 个任务正在运行，会先停止它们。"
@@ -7361,51 +7340,6 @@ class PipelineGUI:
         else:
             self._stop_all_jobs()
 
-    def _stop_all_uploads(self):
-        """Stop every current upload without interrupting production stages."""
-        pipeline_uploads = []
-        for row in pr.list_jobs(limit=10000):
-            job_id = str(row.get("job_id") or "")
-            if not job_id:
-                continue
-            status = pr.load_status(job_id)
-            if status.get("worker_alive") and status.get("stage") == "upload":
-                pipeline_uploads.append(job_id)
-
-        browser_uploads = list(self._active_browser_upload_jobs.values())
-        if not pipeline_uploads and not browser_uploads and not self._script_upload_running:
-            messagebox.showinfo("无需停止", "当前没有正在执行的上传任务。")
-            return
-
-        total = len(pipeline_uploads) + len(browser_uploads)
-        detail = f"将停止当前全部上传任务（共 {total} 个）"
-        if self._script_upload_running:
-            detail += "，并暂停本次运行中的脚本内定时上传队列"
-        detail += "。配音、出图、合成等制作任务不会停止。继续吗？"
-        if not messagebox.askyesno("确认停止上传", detail):
-            return
-
-        # Invalidate sequential batch workers before cancelling their current
-        # item, so they cannot move on to another queued upload.
-        self._upload_stop_generation += 1
-        self._script_publish_paused = True
-        for upload_job in browser_uploads:
-            upload_job.cancelled = True
-
-        errors = []
-        for job_id in pipeline_uploads:
-            try:
-                pr.stop_job(job_id)
-            except Exception as exc:
-                errors.append(f"{job_id}: {exc}")
-
-        self._refresh_jobs()
-        self._update_log()
-        if errors:
-            messagebox.showerror("部分上传停止失败", "\n".join(errors))
-        else:
-            messagebox.showinfo("已停止上传", f"已请求停止 {total} 个上传任务；其他制作任务继续运行。")
-
     def _stop_all_jobs(self):
         """Stop every active worker, including jobs currently in the upload stage."""
         active_stages = {
@@ -7589,7 +7523,8 @@ class PipelineGUI:
                 "{series_title}【{episode_label}】"
             )
             self.project_longform_enabled_var.set(False)
-            self.project_longform_min_final_chars_var.set(str(config.get("longform_default_min_final_chars", 22000)))
+            self.project_longform_min_final_chars_var.set(str(config.get("longform_default_min_final_chars", 18000)))
+            self.project_longform_target_final_chars_var.set(str(config.get("longform_default_target_final_chars", 22000)))
             self.project_longform_max_final_chars_var.set(str(config.get("longform_default_max_final_chars", 88000)))
             self.project_longform_batch_count_var.set(str(config.get("longform_default_batch_episode_count", 5)))
             self.project_longform_name_memory_var.set(False)
@@ -7628,7 +7563,8 @@ class PipelineGUI:
             )
         )
         self.project_longform_enabled_var.set(bool(longform.get("enabled", False)))
-        self.project_longform_min_final_chars_var.set(str(longform.get("min_final_chars") or 22000))
+        self.project_longform_min_final_chars_var.set(str(longform.get("min_final_chars") or 18000))
+        self.project_longform_target_final_chars_var.set(str(longform.get("target_final_chars") or 22000))
         self.project_longform_max_final_chars_var.set(str(longform.get("max_final_chars") or 88000))
         self.project_longform_batch_count_var.set(str(longform.get("batch_episode_count") or 5))
         self.project_longform_name_memory_var.set(bool(longform.get("project_name_memory_enabled", False)))
@@ -7650,11 +7586,15 @@ class PipelineGUI:
             messagebox.showwarning("集数起点无效", "集数起点必须填写正整数。")
             return None
         try:
-            longform_minimum = max(1, int(self.project_longform_min_final_chars_var.get().strip() or "22000"))
-            longform_maximum = max(longform_minimum, int(self.project_longform_max_final_chars_var.get().strip() or "88000"))
+            longform_minimum = max(1, int(self.project_longform_min_final_chars_var.get().strip() or "18000"))
+            longform_target = max(1, int(self.project_longform_target_final_chars_var.get().strip() or "22000"))
+            longform_maximum = max(1, int(self.project_longform_max_final_chars_var.get().strip() or "88000"))
             longform_count = max(1, int(self.project_longform_batch_count_var.get().strip() or "5"))
         except ValueError:
-            messagebox.showwarning("长篇分集设置无效", "最少/最多字数和本轮集数必须填写正整数。")
+            messagebox.showwarning("长篇分集设置无效", "最少、目标、最多字数和本轮集数必须填写正整数。")
+            return None
+        if not (longform_minimum <= longform_target <= longform_maximum):
+            messagebox.showwarning("长篇分集设置无效", "最少字数 ≤ 目标字数 ≤ 最多字数。")
             return None
         try:
             project = pr.update_novel_project_series_settings(
@@ -7675,6 +7615,7 @@ class PipelineGUI:
                 {
                     "enabled": self.project_longform_enabled_var.get(),
                     "min_final_chars": longform_minimum,
+                    "target_final_chars": longform_target,
                     "max_final_chars": longform_maximum,
                     "batch_episode_count": longform_count,
                     "project_name_memory_enabled": self.project_longform_name_memory_var.get(),
@@ -7708,8 +7649,8 @@ class PipelineGUI:
         if not messagebox.askyesno(
             "确认创建本轮任务组",
             f"将从当前续作位置创建最多 {longform.get('batch_episode_count', 5)} 集。\n"
-            f"每集洗稿后目标 {longform.get('min_final_chars', 22000)}–{longform.get('max_final_chars', 88000)} 字，\n"
-            "不足最少字数会追加完整章节。创建后本组会按顺序独占队列。",
+            f"每集洗稿后目标 {longform.get('target_final_chars', 22000)} 字（兜底 {longform.get('min_final_chars', 18000)}–{longform.get('max_final_chars', 88000)} 字），\n"
+            "按最接近目标的完整章节分集；创建后本组会按顺序独占队列。",
             parent=self.root,
         ):
             return
@@ -7859,11 +7800,11 @@ class PipelineGUI:
         self.job_tree.selection_remove(self.job_tree.selection())
         self._selected_job = ""
         self._load_current_project_series_settings()
-        self._refresh_jobs(force=True)
+        self._refresh_jobs()
 
     def _project_job_rows(self) -> list[tuple[dict, dict]]:
         rows = [
-            (row, row.get("_status") or pr.load_status(row["job_id"]))
+            (row, pr.load_status(row["job_id"]))
             for row in pr.list_jobs(limit=10000)
         ]
         selected = self._selected_project_filter()
@@ -8529,10 +8470,7 @@ class PipelineGUI:
             if not force and time.monotonic() < self._next_category_table_refresh_at:
                 return
         elif project_active:
-            selected_project = self._selected_project_filter()
-            poll_key = ("project", base_poll_key, selected_project)
-            if not force and time.monotonic() < self._next_project_table_refresh_at:
-                return
+            poll_key = None
         else:
             poll_key = base_poll_key
         if not force and poll_key is not None and poll_key == self._job_table_refresh_key:
@@ -8557,7 +8495,7 @@ class PipelineGUI:
             full_values = {
                 "title": str(row.get("title", "") or ""),
                 "video": str(row.get("video", "") or ""),
-                "schedule": self._scheduled_publish_time_text(row["job_id"], st),
+                "scheduled_at": self._scheduled_queue_time(st),
                 "youtube": self._youtube_queue_status(row["job_id"], st),
             }
             self._job_table_full_values[str(row["job_id"])] = full_values
@@ -8571,7 +8509,7 @@ class PipelineGUI:
                 self._pronunciation_dictionary_status_text(str(row["job_id"]), st),
                 self._display_job_column("title", full_values["title"]),
                 self._display_job_column("video", full_values["video"]),
-                self._display_job_column("schedule", full_values["schedule"]),
+                self._display_job_column("scheduled_at", full_values["scheduled_at"]),
                 self._display_job_column("youtube", full_values["youtube"]),
             )
             self.job_tree.insert("", tk.END, iid=row["job_id"], values=values)
@@ -8587,46 +8525,17 @@ class PipelineGUI:
             self.job_tree.yview_moveto(yview[0])
         if xview:
             self.job_tree.xview_moveto(xview[0])
-        self._update_job_selection_count()
         self._job_table_refresh_key = poll_key
         if category_active:
             self._next_category_table_refresh_at = time.monotonic() + 10.0
-        elif project_active:
-            self._next_project_table_refresh_at = time.monotonic() + 5.0
-
-    def _scheduled_publish_time_text(self, job_id: str, status: dict) -> str:
-        """Show a compact main-video appointment time beside YouTube status."""
-        scheduled_at = str(status.get("publish_scheduled_at") or "").strip()
-        if not scheduled_at:
-            receipt_path = pr.job_dir_for(str(job_id)) / "upload_result.json"
-            try:
-                receipt = json.loads(receipt_path.read_text(encoding="utf-8")) if receipt_path.exists() else {}
-            except (OSError, json.JSONDecodeError):
-                receipt = {}
-            if isinstance(receipt, dict):
-                mode = str(receipt.get("publish_mode") or "").strip().lower()
-                state = str(receipt.get("schedule_status") or "").strip().lower()
-                if mode == "scheduled" or state == "scheduled":
-                    scheduled_at = str(receipt.get("scheduled_at") or "").strip()
-        if not scheduled_at:
-            return ""
-        try:
-            value = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
-            return f"{value.month}.{value.day}-{value:%H:%M}"
-        except ValueError:
-            match = re.search(r"(\d{1,2})[-/.](\d{1,2}).*?(\d{1,2}):(\d{2})", scheduled_at)
-            if not match:
-                return ""
-            month, day, hour, minute = (int(part) for part in match.groups())
-            return f"{month}.{day}-{hour:02d}:{minute:02d}"
 
     def _youtube_queue_status(self, job_id: str, status: dict) -> str:
         """Return a clear upload state for the queue's YouTube column."""
+        if bool(status.get("youtube_manually_marked_uploaded")):
+            return "✓ 上传成功"
         youtube_url = str(status.get("youtube_url") or "").strip()
         if youtube_url:
             return "✓ 已上传"
-        if bool(status.get("youtube_manually_marked_uploaded")):
-            return "✓ 上传成功"
 
         if str(status.get("stage") or "").strip().lower() == "upload":
             try:
@@ -8634,6 +8543,9 @@ class PipelineGUI:
             except (TypeError, ValueError):
                 progress = 0
             return f"上传中 {progress}%"
+
+        if str(status.get("upload_error") or "").strip():
+            return "上传失败"
 
         # YouTube often does not return a watch URL immediately after a
         # scheduled upload.  Use its saved receipt so this is not shown as a
@@ -8647,18 +8559,22 @@ class PipelineGUI:
             schedule_status = str(receipt.get("schedule_status") or "").strip().lower()
             publish_mode = str(receipt.get("publish_mode") or "").strip().lower()
             scheduled_at = str(receipt.get("scheduled_at") or "").strip()
-            if schedule_status == "needs_review":
-                return "待确认·勿重传"
             if schedule_status == "scheduled" or publish_mode == "scheduled":
                 time_text = scheduled_at.replace("T", " ") if scheduled_at else ""
                 return f"✓ 已上传·定时 {time_text}".strip()
             if str(receipt.get("video_id") or "").strip() or str(receipt.get("url") or "").strip():
                 return "✓ 已上传"
 
-        if str(status.get("upload_error") or "").strip():
-            return "上传失败"
-
         return "未上传"
+
+    @staticmethod
+    def _scheduled_queue_time(status: dict) -> str:
+        value = str(status.get("publish_scheduled_at") or "").strip()
+        try:
+            scheduled = datetime.strptime(value, "%Y-%m-%dT%H:%M")
+            return f"{scheduled.month}.{scheduled.day}-{scheduled:%H:%M}"
+        except ValueError:
+            return ""
 
     def _job_tree_font(self):
         font = getattr(self, "_job_id_font", None)
@@ -8766,8 +8682,7 @@ class PipelineGUI:
                 full_values = getattr(self, "_job_table_full_values", {}).get(str(iid), {})
                 values[7] = self._display_job_column("title", full_values.get("title", values[7]))
                 values[8] = self._display_job_column("video", full_values.get("video", values[8]))
-                values[9] = self._display_job_column("schedule", full_values.get("schedule", values[9]))
-                values[10] = self._display_job_column("youtube", full_values.get("youtube", values[10]))
+                values[9] = self._display_job_column("youtube", full_values.get("youtube", values[9]))
                 self.job_tree.item(iid, values=values)
 
     def _poll_jobs(self):
@@ -8967,91 +8882,22 @@ class PipelineGUI:
 
     def _on_job_select(self, _event=None):
         ids = self._selected_job_ids()
-        self._update_job_selection_count()
         if ids:
             if ids[0] != self._selected_job:
                 self._rendered_log_job = ""
                 self._rendered_log_text = None
             self._selected_job = ids[0]
             self._update_log()
-            # Imported tasks intentionally have no assigned profile.  Do not
-            # disturb the configuration editor for those rows, but make the
-            # editor faithfully reflect a task which has already been pinned
-            # to a saved production profile.
             if len(ids) == 1:
-                status = pr.load_status(ids[0], include_worker=False)
-                profile_name = str(status.get("assigned_profile") or "").strip()
-                if profile_name and profile_name in config.list_profiles():
-                    current = str(self.profile_var.get() if hasattr(self, "profile_var") else "").strip()
-                    if profile_name != current:
-                        self.profile_var.set(profile_name)
-                        self._load_profile(show_confirmation=False)
-
-    def _jobs_missing_assigned_profile(self, job_ids: list[str]) -> list[str]:
-        """Return jobs which must be explicitly pinned before a fresh start."""
-        available = set(config.list_profiles())
-        missing = []
-        for job_id in job_ids:
-            status = pr.load_status(job_id, include_worker=False)
-            profile_name = str(status.get("assigned_profile") or "").strip()
-            if not profile_name or profile_name not in available:
-                missing.append(job_id)
-        return missing
-
-    def _choose_profile_for_unassigned_jobs(self, job_ids: list[str]) -> bool:
-        """Ask the operator to pin a profile, rather than inheriting the UI."""
-        missing = self._jobs_missing_assigned_profile(job_ids)
-        if not missing:
-            return True
-        profiles = config.list_profiles()
-        if not profiles:
-            messagebox.showerror("没有可用配置", "请先创建并保存至少一个流水线配置方案。")
-            return False
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("任务尚未套用流水线配置")
-        dialog.transient(self.root)
-        dialog.resizable(False, False)
-        body = ttk.Frame(dialog, padding=14)
-        body.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(
-            body,
-            text=(
-                f"有 {len(missing)} 个准备启动的任务尚未套用流水线配置。\n\n"
-                "为避免意外沿用当前画面设置，请选择一个方案固定到这些任务；\n"
-                "也可以选择“暂不执行”。"
-            ),
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W)
-        selected = tk.StringVar(value=str(self.profile_var.get() or profiles[0]))
-        if selected.get() not in profiles:
-            selected.set(profiles[0])
-        row = ttk.Frame(body)
-        row.pack(fill=tk.X, pady=(12, 0))
-        ttk.Label(row, text="套用方案：").pack(side=tk.LEFT)
-        ttk.Combobox(row, textvariable=selected, values=profiles, state="readonly", width=30).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        decision = {"apply": False}
-
-        def apply_and_close():
-            profile_name = str(selected.get()).strip()
-            try:
-                pr.apply_profile_to_jobs(missing, profile_name)
-            except Exception as exc:
-                messagebox.showerror("套用方案失败", str(exc), parent=dialog)
-                return
-            decision["apply"] = True
-            dialog.destroy()
-
-        actions = ttk.Frame(body)
-        actions.pack(fill=tk.X, pady=(14, 0))
-        ttk.Button(actions, text="暂不执行", command=dialog.destroy).pack(side=tk.RIGHT)
-        ttk.Button(actions, text="套用并启动", command=apply_and_close, style="Primary.TButton").pack(side=tk.RIGHT, padx=(0, 6))
-        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-        dialog.grab_set()
-        self.root.wait_window(dialog)
-        if decision["apply"]:
-            self._refresh_jobs()
-        return bool(decision["apply"])
+                assigned = str(pr.load_status(ids[0], include_worker=False).get("assigned_profile") or "").strip()
+                if assigned and assigned != str(config.get("active_profile", "") or ""):
+                    try:
+                        config.load_profile(assigned)
+                        config.save()
+                        self.profile_var.set(assigned)
+                        self._refresh_config_form()
+                    except Exception:
+                        pass
 
     def _poll_log(self):
         self._update_log()

@@ -19,6 +19,11 @@ def subtitle_display_text(text: str) -> str:
     return _FURIGANA_RE.sub(lambda match: match.group("written"), str(text or ""))
 
 
+def marketing_display_text(text: str) -> str:
+    """Keep written Japanese while removing inline readings for marketing text."""
+    return _FURIGANA_RE.sub(lambda match: match.group("written"), str(text or ""))
+
+
 def has_inline_furigana(text: str) -> bool:
     """Return whether text contains at least one supported Japanese annotation."""
     return _FURIGANA_RE.search(str(text or "")) is not None

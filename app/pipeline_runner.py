@@ -31,7 +31,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from app.config import (
     API_KEY_FIELDS, DATA_DIR, JOBS_DIR, ROOT, api_key_env_name, config,
-    pronunciation_dictionary_scope, reusable_pronunciation_dictionary_path,
+    marketing_contract, pronunciation_dictionary_scope,
+    reusable_pronunciation_dictionary_path,
 )
 from app import project_manager as projects
 from app.concurrency import external_api_slot, ffmpeg_slot, pid_alive
@@ -42,7 +43,10 @@ from app.scrapers.qingtian import QingtianAggregateScraper, parse_host_list
 from app.scrapers.source_catalog import SourceCatalogScraper
 from app.scrapers.syosetu import SyosetuScraper
 from app.stages.stage2_clean import Segment, split_segments
-from app.text_annotations import has_inline_furigana, subtitle_display_text, tts_narration_text
+from app.text_annotations import (
+    has_inline_furigana, marketing_display_text, subtitle_display_text,
+    tts_narration_text,
+)
 from app.stages.stage6_compose import (
     build_ass,
     build_blurred_portrait_short,
@@ -94,7 +98,6 @@ ProgFn = Callable[[float], None]
 IMAGE_FAILURE_DECISION_FILE = "image_failure_decision.json"
 IMAGE_SELECTION_FILE = "image_selection.json"
 TTS_REDO_REUSE_IMAGES_FILE = "tts_redo_reuse_images.json"
-TTS_INLINE_PRONUNCIATION_REDO_FILE = "tts_inline_pronunciation_redo.json"
 SETTINGS_SNAPSHOT_FILE = "settings_snapshot.json"
 ACCELERATION_PREFETCH_REPORT = "acceleration_prefetch.json"
 REWRITE_REPLACEMENTS_FILE = "text_rewrite_replacements.json"
@@ -103,7 +106,7 @@ SOURCE_INPUT_SNAPSHOT_DIR = "_source_input"
 PRELIMINARY_JOB_PREFIX = "预备分_"
 PRELIMINARY_JOBS_DIR = DATA_DIR / "预备分"
 PRELIMINARY_PACKAGE_MANIFEST = "preliminary_package.json"
-PRELIMINARY_PACKAGE_VERSION = 2
+PRELIMINARY_PACKAGE_VERSION = 1
 PRELIMINARY_REUSABLE_JSON_FILES = (
     "novel.json",
     "segments.json",
@@ -427,7 +430,17 @@ def write_status(job_dir: Path, **updates):
         current["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         temp_path = job_dir / f".status.{os.getpid()}.{threading.get_ident()}.tmp"
         temp_path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temp_path, path)
+        # On Windows, Defender, sync clients, and Explorer can briefly open
+        # status.json just as a progress callback replaces it.  Keep the
+        # completed temp file and retry only that transient access-denied case.
+        for delay in (0.05, 0.1, 0.2, 0.4, 0.8, None):
+            try:
+                os.replace(temp_path, path)
+                break
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) != 5 or delay is None:
+                    raise
+                time.sleep(delay)
 
 
 def _worker_pid_path(job_id: str) -> Path:
@@ -862,41 +875,42 @@ def _resolve_preliminary_package_path(package_dir: Path, value: object, suffix: 
     return resolved
 
 
+def _read_preliminary_reusable_json(package_dir: Path, manifest: dict) -> dict[str, Path]:
+    """Validate optional reusable JSON entries from a preliminary manifest."""
+    entries = manifest.get("reusable_json")
+    if entries is None:
+        return {}
+    if not isinstance(entries, dict):
+        raise ValueError("预备分包中的 reusable_json 无效")
+
+    reusable: dict[str, Path] = {}
+    for name, value in entries.items():
+        if name not in PRELIMINARY_REUSABLE_JSON_FILES:
+            raise ValueError(f"预备分包中的 {name} 无效")
+        try:
+            path = _resolve_preliminary_package_path(package_dir, value, ".json")
+            json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"预备分包中的 {name} 无效") from exc
+        reusable[name] = path
+    return reusable
+
+
 def read_preliminary_package(package_dir: str | Path) -> dict:
     """Validate a preliminary package and return the inputs for a fresh job."""
     root = Path(package_dir).expanduser().resolve()
     manifest = _read_json(root / PRELIMINARY_PACKAGE_MANIFEST, {})
-    version = int(manifest.get("version") or 0)
-    if not root.is_dir() or version not in {1, PRELIMINARY_PACKAGE_VERSION}:
+    if not root.is_dir() or int(manifest.get("version") or 0) != PRELIMINARY_PACKAGE_VERSION:
         raise ValueError("不是可重新导入的预备分包")
     text_path = _resolve_preliminary_package_path(root, manifest.get("text_path"), ".txt")
-    audio_path: Path | None = None
-    audio_value = manifest.get("audio_path")
-    if audio_value:
-        audio_path = _resolve_preliminary_package_path(root, audio_value, ".mp3")
-        inspect_imported_audio(audio_path)
-    elif version == 1:
-        # Version 1 packages always promised an audio-assisted reimport.
-        raise ValueError("预备分包缺少正片 audio_full.mp3")
-    reusable_json: dict[str, Path] = {}
-    json_paths = manifest.get("reusable_json") or {}
-    if not isinstance(json_paths, dict):
-        raise ValueError("预备分包标记中的 JSON 缓存列表无效")
-    for name, value in json_paths.items():
-        if name not in PRELIMINARY_REUSABLE_JSON_FILES:
-            continue
-        cache_path = _resolve_preliminary_package_path(root, value, ".json")
-        try:
-            json.loads(cache_path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"预备分包中的 {name} 无效") from exc
-        reusable_json[name] = cache_path
+    audio_path = _resolve_preliminary_package_path(root, manifest.get("audio_path"), ".mp3")
+    inspect_imported_audio(audio_path)
     return {
         "package_dir": root,
         "text_path": text_path,
         "audio_path": audio_path,
         "title": str(manifest.get("title") or text_path.stem),
-        "reusable_json": reusable_json,
+        "reusable_json": _read_preliminary_reusable_json(root, manifest),
     }
 
 
@@ -942,22 +956,21 @@ def prepare_job_for_preliminary_scoring(job_id: str) -> str:
                 _copy_preliminary_asset(source, staged / name)
         source_text = _preliminary_source_text_path(staged)
         audio_full = staged / "audio_full.mp3"
-        has_main_audio = audio_full.is_file()
+        if not audio_full.is_file():
+            raise FileNotFoundError("预备分包缺少正片 audio_full.mp3，无法重新导入")
+        reusable_json = {
+            name: str((staged / name).relative_to(staged))
+            for name in PRELIMINARY_REUSABLE_JSON_FILES
+            if (staged / name).is_file()
+        }
         _write_json(
             staged / PRELIMINARY_PACKAGE_MANIFEST,
             {
                 "version": PRELIMINARY_PACKAGE_VERSION,
                 "text_path": str(source_text.relative_to(staged)),
-                # Audio is optional for a compact archive.  When present it
-                # lets a reimport skip TTS; otherwise the normal TTS stage
-                # rebuilds the narration from the retained source text.
-                "audio_path": "audio_full.mp3" if has_main_audio else "",
+                "audio_path": "audio_full.mp3",
                 "title": str(status.get("title") or source_text.stem),
-                "reusable_json": {
-                    name: name
-                    for name in PRELIMINARY_REUSABLE_JSON_FILES
-                    if (staged / name).is_file()
-                },
+                "reusable_json": reusable_json,
             },
         )
         shutil.rmtree(path)
@@ -1298,15 +1311,6 @@ def select_next_queued_job(rows: list[dict], *, exclude_job_id: str | None = Non
         ):
             return first_job_id
         return None
-    # A metadata-and-cover repair is deliberately small compared with a full
-    # render.  Put these operator-requested repairs ahead of ordinary queued
-    # jobs so a blocked upload can be unblocked without waiting behind video
-    # generation work.
-    ordinary.sort(
-        key=lambda row: 0
-        if bool((row.get("_status") or {}).get("queued_marketing_cover_only"))
-        else 1
-    )
     return str(ordinary[0]["job_id"]) if ordinary else None
 
 
@@ -1329,19 +1333,10 @@ def complete_longform_batch_member_for_job(job_id: str) -> None:
 
 def start_next_queued_job(*, exclude_job_id: str | None = None, on_log: LogFn = _noop) -> tuple[str, int] | None:
     """Start the next waiting job when worker capacity is available."""
-    rows = list_jobs(limit=500)
     max_jobs = max(1, int(config.get("max_concurrent_jobs", 2)))
-    # Keep title/metadata repairs moving at a modest, bounded parallelism even
-    # when normal full-render capacity is intentionally set to one.
-    if any(
-        str(row.get("stage") or "") == "queued"
-        and bool((row.get("_status") or load_status(str(row.get("job_id") or ""))).get("queued_marketing_cover_only"))
-        for row in rows
-        if str(row.get("job_id") or "")
-    ):
-        max_jobs = max(max_jobs, 4)
     if count_running_workers() >= max_jobs:
         return None
+    rows = list_jobs(limit=500)
     rows.sort(key=lambda row: 0 if str(row.get("stage") or "") == "preprocessed" else 1)
     while rows:
         job_id = select_next_queued_job(rows, exclude_job_id=exclude_job_id)
@@ -1363,7 +1358,6 @@ def start_next_queued_job(*, exclude_job_id: str | None = None, on_log: LogFn = 
                 compose_only=bool(st.get("queued_compose_only", False)),
                 marketing_cover_only=bool(st.get("queued_marketing_cover_only", False)),
                 preprocess_only=bool(st.get("queued_preprocess_only", False)),
-                bypass_capacity=bool(st.get("queued_marketing_cover_only", False)),
             )
             if started[1] <= 0:
                 return None
@@ -1453,6 +1447,7 @@ def create_next_longform_book_batch(project_id: str) -> tuple[dict, list[str], l
             episodes, warnings = plan_longform_episodes(
                 collected,
                 min_final_chars=int(longform["min_final_chars"]),
+                target_final_chars=int(longform["target_final_chars"]),
                 max_final_chars=int(longform["max_final_chars"]),
                 minimum_rewrite_ratio=_rewrite_length_ratio("ai_rewrite_min_length_ratio", 0.75),
                 count=int(longform["batch_episode_count"]),
@@ -1460,7 +1455,7 @@ def create_next_longform_book_batch(project_id: str) -> tuple[dict, list[str], l
             if len(episodes) >= int(longform["batch_episode_count"]) and episodes[-1]["estimated_final_chars"] >= int(longform["min_final_chars"]):
                 break
         else:
-            episodes, warnings = plan_longform_episodes(collected, min_final_chars=int(longform["min_final_chars"]), max_final_chars=int(longform["max_final_chars"]), minimum_rewrite_ratio=_rewrite_length_ratio("ai_rewrite_min_length_ratio", 0.75), count=int(longform["batch_episode_count"]))
+            episodes, warnings = plan_longform_episodes(collected, min_final_chars=int(longform["min_final_chars"]), target_final_chars=int(longform["target_final_chars"]), max_final_chars=int(longform["max_final_chars"]), minimum_rewrite_ratio=_rewrite_length_ratio("ai_rewrite_min_length_ratio", 0.75), count=int(longform["batch_episode_count"]))
     finally:
         scraper.close()
     if not episodes:
@@ -1506,7 +1501,7 @@ def create_next_longform_local_batch(project_id: str) -> tuple[dict, list[str], 
         raise RuntimeError("长篇项目原文已变化，请新建项目或重新绑定源文")
     chapters = _local_longform_chapters(path)
     cursor = max(1, int(longform.get("reserved_next_chapter") or 1))
-    episodes, warnings = plan_longform_episodes(chapters[cursor - 1:], min_final_chars=int(longform["min_final_chars"]), max_final_chars=int(longform["max_final_chars"]), minimum_rewrite_ratio=_rewrite_length_ratio("ai_rewrite_min_length_ratio", 0.75), count=int(longform["batch_episode_count"]))
+    episodes, warnings = plan_longform_episodes(chapters[cursor - 1:], min_final_chars=int(longform["min_final_chars"]), target_final_chars=int(longform["target_final_chars"]), max_final_chars=int(longform["max_final_chars"]), minimum_rewrite_ratio=_rewrite_length_ratio("ai_rewrite_min_length_ratio", 0.75), count=int(longform["batch_episode_count"]))
     if not episodes:
         raise RuntimeError("没有剩余正文可创建任务组")
     settings_snapshot = _longform_settings_snapshot(longform)
@@ -1518,7 +1513,8 @@ def create_next_longform_local_batch(project_id: str) -> tuple[dict, list[str], 
 def _longform_settings_snapshot(longform: dict) -> dict:
     """Freeze the planning choices that produced a durable task group."""
     return {
-        "min_final_chars": int(longform.get("min_final_chars") or 22_000),
+        "min_final_chars": int(longform.get("min_final_chars") or 18_000),
+        "target_final_chars": int(longform.get("target_final_chars") or 22_000),
         "max_final_chars": int(longform.get("max_final_chars") or 88_000),
         "batch_episode_count": int(longform.get("batch_episode_count") or 5),
         "project_name_memory_enabled": bool(longform.get("project_name_memory_enabled", False)),
@@ -1936,16 +1932,9 @@ def stage_clean(
         text = _rewrite_story_text(text, on_log=on_log, job_dir=job_dir)
         if bool(config.get("tts_clean_rewritten_text", True)) and not has_inline_furigana(text):
             text = _clean_rewritten_narration_text(text, on_log=on_log, job_dir=job_dir)
-        pronunciation_result = _generate_auto_pronunciation_dictionary(text, on_log=on_log, job_dir=job_dir)
-        if bool(config.get("tts_inline_pronunciation_enabled", False)) and pronunciation_result.get("path"):
-            try:
-                source = Path(pronunciation_result["path"]).read_text(encoding="utf-8-sig")
-                entries = parse_pronunciation_dictionary(source)
-                text, marked = _add_inline_pronunciation_annotations(text, entries)
-                if marked:
-                    on_log(f"  自动正文读音标注：已标注 {marked} 处；TTS 读取括号内假名，字幕隐藏标注")
-            except Exception as exc:
-                on_log(f"  WARN 自动正文读音标注失败，已保留词典方式朗读: {exc}")
+        elif has_inline_furigana(text):
+            on_log("  检测到日文括号注音：保留原分段，最终 TTS 前再转换读音")
+        _generate_auto_pronunciation_dictionary(text, on_log=on_log, job_dir=job_dir)
     segs = split_segments(text)
     on_log(f"  OK 切成 {len(segs)} 段")
     if not segs:
@@ -1960,6 +1949,7 @@ def plan_longform_episodes(
     max_final_chars: int,
     minimum_rewrite_ratio: float,
     count: int,
+    target_final_chars: int | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Group consecutive source chapters into final-character-targeted episodes.
 
@@ -1968,6 +1958,7 @@ def plan_longform_episodes(
     """
     minimum = max(1, int(min_final_chars))
     maximum = max(minimum, int(max_final_chars))
+    target = min(maximum, max(minimum, int(target_final_chars or 22_000)))
     multiplier = max(0.001, float(minimum_rewrite_ratio))
     target_count = max(1, int(count))
     episodes: list[dict] = []
@@ -1980,12 +1971,16 @@ def plan_longform_episodes(
         while cursor < len(chapters):
             chapter = chapters[cursor]
             chapter_chars = len(str(chapter.text or "")) * multiplier
-            if cursor > start and estimated_chars >= minimum and estimated_chars + chapter_chars > maximum:
-                break
+            if cursor > start and estimated_chars >= minimum:
+                next_total = estimated_chars + chapter_chars
+                if abs(estimated_chars - target) <= abs(next_total - target):
+                    break
             estimated_chars += chapter_chars
             source_chars += len(str(chapter.text or ""))
             cursor += 1
-            if cursor == start + 1 and chapter_chars > maximum:
+            if (cursor == start + 1 and chapter_chars > maximum) or (
+                estimated_chars > maximum and estimated_chars - chapter_chars < minimum
+            ):
                 warnings.append(f"第{chapter.index}章预计洗稿后字数超过上限，已按完整章节保留。")
                 break
         selected = chapters[start:cursor]
@@ -2221,91 +2216,22 @@ def _clean_voicevox_narration_text(text: str) -> str:
     return value
 
 
-def _clean_edge_style_narration_text(text: str, *, preserve_inline_annotations: bool = True) -> str:
+def _clean_edge_style_narration_text(text: str) -> str:
     """Normalize punctuation more aggressively for Edge-style narrators."""
     value = _remove_format_control_characters(text)
     value = _NARRATION_URL_RE.sub("", value)
     value = _NARRATION_EMOJI_RE.sub("", value)
-    # Before the TTS conversion, keep authored Japanese reading annotations
-    # intact. Stripping their brackets early would join the written form and
-    # its reading, making the narrator pronounce both of them.
-    protected_annotations: list[str] = []
-
-    def protect_annotation(match: re.Match) -> str:
-        token = f"TTSRUBYTOKEN{len(protected_annotations)}X"
-        protected_annotations.append(match.group(0))
-        return token
-
-    if preserve_inline_annotations:
-        value = _INLINE_PRONUNCIATION_RE.sub(protect_annotation, value)
     value = re.sub(r"[#$＃＊*•●◆◇▪▫]+", "", value)
     value = _NARRATION_DECORATION_RE.sub("", value)
     value = re.sub(r"(?:\.{2,}|…+)", "。", value)
-    value = re.sub(r"(?:[—―－〜～]+|-+)", "，", value)
+    value = re.sub(r"(?:[—―－〜～]+|-{2,})", "，", value)
     value = re.sub(r"[，,]{2,}", "，", value)
     value = re.sub(r"[。]{2,}", "。", value)
-    if preserve_inline_annotations:
-        for index, annotation in enumerate(protected_annotations):
-            value = value.replace(f"TTSRUBYTOKEN{index}X", annotation)
     return value
 
 
 _JP_KANJI_RE = re.compile(r"[\u3400-\u9fff々〆ヶ]")
 _JP_READING_RE = re.compile(r"^[ぁ-ゖァ-ヺー・]+$")
-# Operator-authored, inline reading annotations are exact per-occurrence TTS
-# overrides.  The written form may include okurigana, for example
-# 「煮詰めた（につめた）」; subtitles remove the annotation separately.
-_INLINE_PRONUNCIATION_RE = re.compile(
-    # A common particle stops the preceding sentence from being captured,
-    # while the middle group still supports compounds such as
-    # 「持ち合わせ」 and 「行き着いた」.
-    r"(?P<written>[\u3400-\u9fff々〆ヶ]+"
-    r"(?:(?:(?![はがをにへとでのもや])[ぁ-ゖァ-ヺー・])+[\u3400-\u9fff々〆ヶ]+)*"
-    r"[ぁ-ゖァ-ヺー・]*)\s*[（(]\s*"
-    r"(?P<reading>[ぁ-ゖァ-ヺー・]+)\s*[）)]"
-)
-# Source text can use standard okurigana, such as
-# 「煮詰めた（につめた）」.  For source cleanup we only need to remove the
-# reading suffix, not rediscover the word boundary, which is ambiguous in
-# unsegmented Japanese text.
-_INLINE_PRONUNCIATION_SUFFIX_RE = re.compile(
-    r"(?<=[\u3400-\u9fff々〆ヶぁ-ゖァ-ヺー・])\s*[（(]\s*"
-    r"[ぁ-ゖァ-ヺー・]+\s*[）)]"
-)
-
-
-def _apply_inline_pronunciation_annotations(text: str) -> tuple[str, int]:
-    """Turn ``漢字+送り仮名（かな）`` into TTS-only kana, preserving subtitles."""
-    replacements = 0
-
-    def replace(match: re.Match) -> str:
-        nonlocal replacements
-        replacements += 1
-        return match.group("reading")
-
-    return _INLINE_PRONUNCIATION_RE.sub(replace, str(text or "")), replacements
-
-
-def _strip_inline_pronunciation_annotations(text: str) -> str:
-    """Restore visible source text before asking the API to mark it again."""
-    return _INLINE_PRONUNCIATION_SUFFIX_RE.sub("", str(text or ""))
-
-
-def _add_inline_pronunciation_annotations(text: str, entries: list[tuple[str, str]]) -> tuple[str, int]:
-    """Mark exact dictionary matches as ``漢字（かな）`` for per-occurrence TTS."""
-    if not text or not entries:
-        return str(text or ""), 0
-    readings = dict(entries)
-    pattern = re.compile("|".join(re.escape(written) for written, _reading in entries))
-    replacements = 0
-
-    def replace(match: re.Match) -> str:
-        nonlocal replacements
-        replacements += 1
-        written = match.group(0)
-        return f"{written}（{readings[written]}）"
-
-    return pattern.sub(replace, str(text)), replacements
 
 
 def _pronunciation_text_chunks(text: str, maximum_chars: int = 2200) -> list[str]:
@@ -2367,14 +2293,13 @@ def _generate_auto_pronunciation_dictionary(
     report_path = job_dir / "tts_auto_pronunciation_report.json"
     auto_path.unlink(missing_ok=True)
     report_path.unlink(missing_ok=True)
-    inline_enabled = bool(config.get("tts_inline_pronunciation_enabled", False))
-    if not force and not bool(config.get("tts_auto_pronunciation_enabled", False)) and not inline_enabled:
+    if not force and not bool(config.get("tts_auto_pronunciation_enabled", False)):
         return {"entries": 0, "reason": "disabled"}
-    if str(config.tts_provider or "").lower() not in TTS_MANUAL_PRONUNCIATION_PROVIDERS and not inline_enabled:
+    if str(config.tts_provider or "").lower() not in TTS_MANUAL_PRONUNCIATION_PROVIDERS:
         on_log("  自动读音审校仅适用于 Edge 或 VOICEVOX，已跳过")
         return {"entries": 0, "reason": "unsupported_provider"}
     if not _can_call_pronunciation_dictionary_llm():
-        on_log("  自动读音审校已开启，但未配置文本 API；已跳过")
+        on_log("  自动读音词典已开启，但未配置文本 API；已跳过")
         return {"entries": 0, "reason": "missing_api"}
     try:
         max_terms = max(1, min(1000, int(config.get("tts_auto_pronunciation_max_terms", 300) or 300)))
@@ -2391,16 +2316,6 @@ def _generate_auto_pronunciation_dictionary(
             "出力は厳密に「原語=よみがな」の形式を1行ずつのみとし、原語は必ず原文に一字も違わず存在するものだけにしてください。"
             "ひらがなのみ、またはカタカナのみの語は出力せず、原文を改変せず、不明な場合は省略してください。"
         )
-    if inline_enabled:
-        # Inline ruby is intended to make the whole narration deterministic,
-        # whereas dictionary mode deliberately limits itself to difficult terms.
-        # Append this requirement so it also overrides an older operator-saved
-        # prompt that still says to omit ordinary words.
-        system += (
-            "\n今回は難読語だけを選ぶ辞書作成ではなく、全文への読み仮名付与です。"
-            "一般的な常用語も省略せず、原文を先頭から末尾まで確認し、漢字を含むすべての語句を漏れなく抽出してください。"
-            "助詞との結合や活用によって読みが変わる場合は、その読みを一意に決められる完全な原文語句を左辺にしてください。"
-        )
     route = _pronunciation_dictionary_route_settings()
     llm = LLMBackend(
         provider=route["provider"], base_url=route["base_url"], api_key=route["api_key"], model=route["model"],
@@ -2411,11 +2326,6 @@ def _generate_auto_pronunciation_dictionary(
         "誤った読みを修正し、漏れた漢字を含む語句を補ってください。原語は必ず原文に一字も違わず存在するものだけにしてください。"
         "説明やMarkdown、ひらがなのみまたはカタカナのみの語は出力せず、よみがなにはかな・中黒・長音符だけを使ってください。"
     )
-    if inline_enabled:
-        audit_system += (
-            "これは全文への読み仮名付与です。難読語だけに限定せず、一般的な語も含め、"
-            "原文中の漢字を含むすべての語句が一覧で網羅されているか確認し、漏れを必ず補ってください。"
-        )
     entries: list[tuple[str, str]] = []
     calls = 0
     for index, chunk in enumerate(chunks, start=1):
@@ -2444,9 +2354,7 @@ def _generate_auto_pronunciation_dictionary(
         readings.pop(written, None)
     # Keep the file readable and auditable in first-appearance order.  The
     # parser independently switches to longest-match order before replacement.
-    # Full-text inline annotation must not silently stop after the dictionary
-    # entry limit. Each API chunk is already bounded independently.
-    accepted = list(readings.items()) if inline_enabled else list(readings.items())[:max_terms]
+    accepted = list(readings.items())[:max_terms]
     _write_json(
         report_path,
         {
@@ -2465,7 +2373,7 @@ def _generate_auto_pronunciation_dictionary(
     auto_path.write_text("\n".join(f"{written}={reading}" for written, reading in accepted) + "\n", encoding="utf-8")
     on_log(f"  自动读音审校：{len(chunks)} 段、{calls} 次 API，采用 {len(accepted)} 条，跳过歧义 {len(conflicts)} 条")
     learned = {"added": 0, "conflicts": []}
-    if bool(config.get("tts_profile_pronunciation_auto_learn", True)) and not inline_enabled:
+    if bool(config.get("tts_profile_pronunciation_auto_learn", True)):
         learned = merge_profile_pronunciation_dictionary(accepted)
         on_log(
             f"  配置词库「{learned['profile']}」：新增 {learned['added']} 条，"
@@ -3141,23 +3049,7 @@ def _is_transient_json_response_error(error: str) -> bool:
     unattended queue moving without delaying deterministic validation errors.
     """
     text = str(error or "").lower()
-    # A length-limited empty response is deterministic, not transient: the
-    # caller should immediately retry with a larger output allowance instead
-    # of sleeping for a minute first.
-    if "text api returned empty assistant content" in text and "finish_reason=length" in text:
-        return False
-    return (
-        "llm did not return a json object" in text
-        or "text api returned empty assistant content" in text
-        or any(marker in text for marker in (
-            "http 429", "429 too many requests",
-            "http 500", "500 internal server error",
-            "http 502", "502 bad gateway",
-            "http 503", "503 service unavailable",
-            "http 504", "504 gateway timeout",
-            "timed out", "timeout", "connection reset", "connection refused",
-        ))
-    )
+    return "llm did not return a json object" in text
 
 
 def _stable_hash(value) -> str:
@@ -3437,20 +3329,10 @@ def _prepare_tts_pronunciation(
         str(config.get("active_profile", "配置1") or "配置1"),
         config.get("tts_pronunciation_dictionary_scope", "profile"),
     )
-    # Inline annotations are a per-occurrence override, unlike a dictionary
-    # which must apply one reading to every occurrence of its left-hand side.
-    # They work even without a separate dictionary and always win over it.
-    inline_applied = [_apply_inline_pronunciation_annotations(seg.text) for seg in segments]
-    narration_texts = [item[0] for item in inline_applied]
-    replacement_counts = [item[1] for item in inline_applied]
-    # This final pass is deliberately independent of the optional source-text
-    # cleanup setting.  It runs after inline readings have become kana, so it
-    # cannot destroy their brackets before conversion, and prevents a TTS
-    # backend from narrating symbols such as dashes or parentheses.
-    narration_texts = [
-        _clean_edge_style_narration_text(text, preserve_inline_annotations=False)
-        for text in narration_texts
-    ]
+    # Inline annotations are explicit user instructions and must win over any
+    # optional dictionary.  This path deliberately runs for every provider.
+    narration_texts = [tts_narration_text(seg.text) for seg in segments]
+    replacement_counts = [0 for _seg in segments]
 
     # Both uploaded and double-audited automatic dictionaries are safe text
     # substitutions for Edge and VOICEVOX.  Subtitle source remains unchanged.
@@ -3483,8 +3365,10 @@ def _prepare_tts_pronunciation(
         + "\n--manual--\n" + manual_source.lstrip("\ufeff")
     )
     applied = [_apply_pronunciation_dictionary(text, dictionary_entries) for text in narration_texts]
-    narration_texts = [item[0] for item in applied]
-    replacement_counts = [inline + item[1] for inline, item in zip(replacement_counts, applied)]
+    # Dictionary values are operator-entered text too, so run the mandatory
+    # final symbol pass once more after all substitutions.
+    narration_texts = [tts_narration_text(item[0]) for item in applied]
+    replacement_counts = [item[1] for item in applied]
     return narration_texts, replacement_counts, dictionary_entries, dictionary_hash
 
 
@@ -4223,40 +4107,6 @@ def redo_all_tts_reuse_images(job_id: str) -> dict:
     return {**result, "images_reused": len(images)}
 
 
-def redo_inline_pronunciation_and_tts(job_id: str) -> dict:
-    """Queue a full-text inline reading review followed by all TTS segments."""
-    if is_worker_running(job_id):
-        raise RuntimeError(f"{job_id} 正在运行。请先停止任务，再重新标音。")
-    job_dir = _safe_job_path(job_id)
-    segments = _read_saved_segments(job_dir / "segments.json") or []
-    images = _valid_scene_images(job_dir)
-    audio_dir = job_dir / "audio"
-    if audio_dir.exists():
-        shutil.rmtree(audio_dir)
-    for name in (TTS_AUTO_PRONUNCIATION_DICTIONARY, "tts_auto_pronunciation_report.json"):
-        (job_dir / name).unlink(missing_ok=True)
-    _clear_downstream_after_tts_change(job_dir)
-    _write_json(job_dir / TTS_INLINE_PRONUNCIATION_REDO_FILE, {
-        "mode": "full_text_inline_pronunciation_and_all_tts",
-        "requested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "had_segments": bool(segments),
-    })
-    if images:
-        _write_json(job_dir / IMAGE_SELECTION_FILE, {
-            "mode": "cycle", "available_images": len(images), "total_images": 0,
-            "paths": [str(path.relative_to(job_dir)) for _index, path in images],
-            "chosen_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "awaiting_rebuilt_timing_plan": True,
-        })
-        _write_json(job_dir / TTS_REDO_REUSE_IMAGES_FILE, {
-            "mode": "reuse_existing_images_only", "images": len(images),
-            "requested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        })
-    write_status(job_dir, stage="queued", progress=0.10, worker_pid=None, error="", youtube_url="")
-    append_log(job_dir, "queued: redo full-text inline pronunciation through text API and regenerate all TTS")
-    return {"job_id": job_id, "segments": len(segments), "images_reused": len(images)}
-
-
 def generate_pronunciation_dictionary_for_job(job_id: str) -> dict:
     """Generate and apply the double-audited dictionary to an existing job.
 
@@ -4333,9 +4183,6 @@ def _stage_tts_manifest_impl(
     )
     if provider == "voxcpm":
         on_log("  VoxCPM2 使用进程内模型缓存和单路 MPS 推理，已忽略 TTS 多并发与子进程隔离设置")
-    inline_annotations = sum(len(_INLINE_PRONUNCIATION_RE.findall(seg.text)) for seg in segments)
-    if inline_annotations:
-        on_log(f"  inline pronunciation annotations: {inline_annotations} per-occurrence overrides applied")
     if dictionary_entries:
         changed_segments = sum(1 for count in replacement_counts if count)
         total_replacements = sum(replacement_counts)
@@ -4693,6 +4540,19 @@ def stage_tts(
             raise RuntimeError("导入的 MP3 无法读取或时长为 0，请重新导入。")
         if not segments:
             raise RuntimeError("没有可用的文本切片，无法为导入音频生成时间轴。")
+        if str(manifest.get("timing_mode") or "") == "subtitle_locked":
+            durations = _read_json(job_dir / "durations.json", [])
+            if not isinstance(durations, list) or len(durations) != len(segments):
+                raise RuntimeError("锁定字幕时间轴缺失或与文本段数不一致。")
+            durations = [float(value) for value in durations]
+            if any(value <= 0.0 for value in durations) or abs(sum(durations) - total_duration) > 1.0:
+                raise RuntimeError("锁定字幕时间轴无效或与导入音频时长不一致。")
+            on_log(
+                f"[3/6] 使用锁定导入 MP3，跳过 TTS：{manifest.get('original_name') or audio_path.name} "
+                f"({total_duration:.1f}s, {len(segments)} 个字幕段)"
+            )
+            on_prog(1.0)
+            return [audio_path], durations
         weights = [max(0.001, _estimated_speech_duration(seg.text)) for seg in segments]
         weight_total = sum(weights)
         durations = [total_duration * weight / weight_total for weight in weights]
@@ -5631,7 +5491,7 @@ def stage_storyboard_and_image(
                         attempt_prompt = _policy_safe_image_prompt(
                             f"{config.llm_image_prompt_prefix} "
                             "Create a calm, family-friendly symbolic interpretation of the selected story moment. "
-                            "Keep the same fantasy world, character designs, costumes, palette, and illustration style "
+                            "Keep this video's stated world, era, character designs, costumes, palette, and illustration style "
                             "as this video's other scenes. Show emotion through facial expressions, distance, lighting, "
                             "and environment only; no direct harm or explicit content. "
                             f"{retry_context}",
@@ -5903,7 +5763,8 @@ def _fallback_marketing_tags(
             return [
                 "#三国演义", "#三国历史", "#中国历史", "#中国古代史", "#古典文学",
                 "#历史故事", "#历史小说", "#群雄争霸", "#名将", "#谋略",
-                "#战争史", "#小说推文", "#中文说书",
+                "#战争史", "#小说推文", "#中文说书", "#三国人物", "#乱世英雄",
+                "#古代战争", "#权谋", "#经典名著", "#历史人物", "#三国故事",
             ]
         return _three_kingdoms_fallback_tags()
     # Do not guess genre, romance, gender, or setting when the LLM response is
@@ -5912,8 +5773,13 @@ def _fallback_marketing_tags(
         return [
             "#小说", "#故事", "#有声小说", "#小说推文", "#中文说书",
             "#文学", "#长篇小说", "#剧情", "#人物故事", "#原创故事",
+            "#小说推荐", "#故事会", "#叙事", "#小说阅读", "#文学作品",
+            "#情节", "#角色故事", "#故事分享", "#文字故事", "#有声故事",
         ]
-    return ["#小説", "#朗読", "#物語", "#オーディオブック", "#ストーリー", "#小説紹介", "#動画", "#文学", "#長編", "#創作"]
+    return [
+        "#小説", "#朗読", "#物語", "#オーディオブック", "#ストーリー", "#小説紹介", "#動画", "#文学", "#長編", "#創作",
+        "#フィクション", "#読み聞かせ", "#物語紹介", "#読書", "#小説動画", "#文章", "#創作小説", "#物語動画", "#小説朗読", "#ストーリー動画",
+    ]
 
 
 def _three_kingdoms_fallback_tags() -> list[str]:
@@ -5921,7 +5787,7 @@ def _three_kingdoms_fallback_tags() -> list[str]:
     return [
         "#三国志", "#三国志演義", "#中国史", "#中国古代史", "#歴史",
         "#歴史物語", "#歴史小説", "#群雄割拠", "#武将", "#軍師",
-        "#戦記", "#朗読", "#物語",
+        "#戦記", "#朗読", "#物語", "#中国文学", "#古典", "#戦国", "#兵法", "#政略", "#英雄", "#中国史朗読",
     ]
 
 
@@ -6062,11 +5928,40 @@ def _prebuilt_short_script_error(
     return ""
 
 
-def _candidate_tags(value) -> list[str]:
+def _marketing_contract() -> dict[str, int]:
+    """Return the active profile's normalized marketing-output contract."""
+    return marketing_contract(config.as_dict())
+
+
+def _marketing_display_value(value):
+    """Remove Japanese inline readings from nested marketing evidence."""
+    if isinstance(value, str):
+        return marketing_display_text(value)
+    if isinstance(value, list):
+        return [_marketing_display_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _marketing_display_value(item) for key, item in value.items()}
+    return value
+
+
+def _marketing_json_shape(contract: dict[str, int], language: str) -> str:
+    title_label = "标题" if language == "zh" else "タイトル"
+    synopsis_label = "简介" if language == "zh" else "あらすじ"
+    tag_label = "标签" if language == "zh" else "タグ"
+    return json.dumps({
+        "titles": [f"{title_label}{index}" for index in range(1, contract["title_count"] + 1)],
+        "synopses": [f"{synopsis_label}{index}" for index in range(1, contract["synopsis_count"] + 1)],
+        "tags": [f"#{tag_label}{index}" for index in range(1, contract["tag_min_count"] + 1)],
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+def _candidate_tags(value, max_count: int | None = None) -> list[str]:
+    if max_count is None:
+        max_count = _marketing_contract()["tag_max_count"]
     rows = value if isinstance(value, list) else re.findall(r"#[^#\s【】]+", str(value or ""))
     tags: list[str] = []
     for raw in rows:
-        tag = re.sub(r"\s+", "", str(raw or "").strip())
+        tag = re.sub(r"\s+", "", marketing_display_text(str(raw or "")).strip())
         tag_name = tag.lstrip("#＃").strip("【】[]")
         if not tag or re.sub(r"[・·]", "", tag_name) == "朗読小説":
             continue
@@ -6078,27 +5973,31 @@ def _candidate_tags(value) -> list[str]:
             continue
         if tag not in tags:
             tags.append(tag)
-    return tags[:15]
+    return tags[:max(0, int(max_count))]
 
 
 def _parse_marketing_candidates(raw) -> dict:
+    contract = _marketing_contract()
     data = raw if isinstance(raw, dict) else parse_json_object(str(raw or ""))
     titles_raw = data.get("titles") or data.get("video_titles") or data.get("動画タイトル") or []
     synopses_raw = data.get("synopses") or data.get("summaries") or data.get("あらすじ") or []
-    titles = [_candidate_title(x) for x in titles_raw] if isinstance(titles_raw, list) else []
-    synopses = [_candidate_synopsis(x) for x in synopses_raw] if isinstance(synopses_raw, list) else []
+    titles = [marketing_display_text(_candidate_title(x)) for x in titles_raw] if isinstance(titles_raw, list) else []
+    synopses = [marketing_display_text(_candidate_synopsis(x)) for x in synopses_raw] if isinstance(synopses_raw, list) else []
     # Internal source labels are never titles.  Dropping them here forces a
     # corrective LLM retry instead of letting task metadata reach upload.
     titles = [x for x in titles if x and not _contains_marketing_source_wrapper(x)]
     synopses = [x for x in synopses if x]
-    tags = _candidate_tags(data.get("tags") or data.get("hashtags") or data.get("タグ") or [])
+    tags = _candidate_tags(
+        data.get("tags") or data.get("hashtags") or data.get("タグ") or [],
+        contract["tag_max_count"],
+    )
     series_short_title = re.sub(r"\s+", " ", str(
         data.get("series_short_title") or data.get("series_title") or data.get("系列短名") or ""
     )).strip().strip("【】[]『』「」")
     series_short_title = re.sub(r"[｜|].*$", "", series_short_title).strip()
     return {
-        "titles": titles[:3],
-        "synopses": synopses[:2],
+        "titles": titles[:contract["title_count"]],
+        "synopses": synopses[:contract["synopsis_count"]],
         "tags": tags,
         "tag_line": "".join(tags),
         "series_short_title": series_short_title[:18],
@@ -6108,33 +6007,24 @@ def _parse_marketing_candidates(raw) -> dict:
     }
 
 
-def _marketing_validation_error(bundle: dict, min_chars: int, max_chars: int) -> str:
+def _marketing_validation_error(bundle: dict, contract: dict[str, int] | None = None) -> str:
+    rules = contract or _marketing_contract()
     titles = bundle.get("titles") if isinstance(bundle.get("titles"), list) else []
     synopses = bundle.get("synopses") if isinstance(bundle.get("synopses"), list) else []
     problems = []
-    if len(titles) != 3:
-        problems.append(f"titles={len(titles)} (required 3)")
+    if len(titles) != rules["title_count"]:
+        problems.append(f"titles={len(titles)} (required {rules['title_count']})")
     if len(set(titles)) != len(titles):
         problems.append("titles must be distinct")
-    bad_title_lengths = [
-        f"title{index}={len(title)}"
-        for index, title in enumerate(titles, start=1)
-        if len(title) < min_chars or len(title) > max_chars
-    ]
-    if bad_title_lengths:
-        problems.append(
-            f"title lengths outside {min_chars}-{max_chars}: {', '.join(bad_title_lengths)}"
-        )
     if any(_contains_marketing_source_wrapper(title) for title in titles):
         problems.append("titles contain source-wrapper text")
-    if len(synopses) != 2:
-        problems.append(f"synopses={len(synopses)} (required 2)")
-    bad_synopsis_lengths = [len(x) for x in synopses if len(x) < 80 or len(x) > 160]
-    if bad_synopsis_lengths:
-        problems.append(f"synopsis lengths outside 80-160: {bad_synopsis_lengths}")
+    if len(synopses) != rules["synopsis_count"]:
+        problems.append(f"synopses={len(synopses)} (required {rules['synopsis_count']})")
     tags = bundle.get("tags") if isinstance(bundle.get("tags"), list) else []
-    if not 10 <= len(tags) <= 15:
-        problems.append(f"tags={len(tags)} (required 10-15)")
+    if not rules["tag_min_count"] <= len(tags) <= rules["tag_max_count"]:
+        problems.append(
+            f"tags={len(tags)} (required {rules['tag_min_count']}-{rules['tag_max_count']})"
+        )
     return "; ".join(problems)
 
 
@@ -6151,36 +6041,10 @@ def _marketing_topic_error(bundle: dict, *source_values) -> str:
 
 
 def _marketing_title_style_error(bundle: dict, language: str) -> str:
-    """Reject title styles that create repetitive or unfinished uploads."""
-    titles = bundle.get("titles") if isinstance(bundle.get("titles"), list) else []
-    # Episode metadata is added once by the series upload layer.  Reject it
-    # from AI copy in every supported spelling/language so it cannot become
-    # ``第206話〜第208話 ... 第208話`` and consume the YouTube title limit.
-    episode_marker = re.compile(
-        r"第\s*[0-9０-９零〇一二两兩三四五六七八九十百千]+\s*"
-        r"(?:话|話|集|回|章|篇|部|期)"
-    )
-    if language == "zh" and any("三国志完全解说" in str(title or "") for title in titles):
-        return "candidate titles must not repeat the fixed series label"
-    if any(episode_marker.search(str(title or "")) for title in titles):
-        return "candidate titles must not contain episode/chapter labels"
-    normalized_titles = [
-        re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", str(title or ""))).casefold()
-        for title in titles
-    ]
-    for left_index, left in enumerate(normalized_titles):
-        for right in normalized_titles[left_index + 1:]:
-            shorter, longer = sorted((left, right), key=len)
-            if shorter and shorter in longer and len(shorter) >= int(len(longer) * 0.65):
-                return "candidate titles are substantially duplicated"
+    """Keep Chinese history candidates in a stable storytelling-program voice."""
     if language != "zh":
-        # These endings are unambiguously incomplete in generated/fallback
-        # Japanese titles.  A length-only check previously allowed source
-        # excerpts ending in e.g. 「この老侠が」 to reach upload.
-        incomplete_ja = re.compile(r"(?:が|を|に|へ|で|と|の|は|も|から|ので|ながら|すると|そして|、|，|：|:|――)$")
-        if any(incomplete_ja.search(str(title or "").strip()) for title in titles):
-            return "candidate titles contain an incomplete Japanese clause"
         return ""
+    titles = bundle.get("titles") if isinstance(bundle.get("titles"), list) else []
     question_openers = re.compile(r"(?:为什么|为何|何以|究竟|到底|怎么|如何|谁才|是否|难道)")
     question_like = [
         title for title in titles
@@ -6188,12 +6052,18 @@ def _marketing_title_style_error(bundle: dict, language: str) -> str:
     ]
     if len(question_like) > 1:
         return f"Chinese history titles use too many question hooks: {len(question_like)} (maximum 1)"
+    if any("三国志完全解说" in str(title or "") for title in titles):
+        return "candidate titles must not repeat the fixed series label"
+    if any(re.search(r"第\s*[0-9零〇一二两兩三四五六七八九十百千]+\s*话", str(title or "")) for title in titles):
+        return "candidate titles must not repeat the fixed episode label"
     return ""
 
 
 def _fallback_marketing_candidates(
-    novel: Novel, story_material: str, min_chars: int = 40,
-    max_chars: int | None = None, language: str = "ja",
+    novel: Novel,
+    story_material: str,
+    language: str = "ja",
+    contract: dict[str, int] | None = None,
 ) -> dict:
     """Produce upload-safe local metadata when a text gateway cannot return JSON.
 
@@ -6201,20 +6071,14 @@ def _fallback_marketing_candidates(
     moving without silently turning an API formatting outage into a pipeline
     failure.  The generated candidates remain editable in the GUI afterwards.
     """
-    # Backward compatibility for older callers that passed only max_chars.
-    if max_chars is None:
-        max_chars = int(min_chars or 70)
-        min_chars = 40
-    clean_title = _clean_display_title(novel.title)
+    rules = contract or _marketing_contract()
+    clean_title = marketing_display_text(_clean_display_title(novel.title))
     is_three_kingdoms = _is_three_kingdoms_material(
         novel.title, novel.full_text, story_material
     )
-    # U+FEFF commonly survives at the beginning of imported UTF-8 text.  It
-    # prevented the chapter-heading expression below from matching, after
-    # which the fallback was rejected by our own no-episode-label validator.
-    compact = re.sub(r"\s+", " ", str(novel.full_text or story_material or "")).strip().lstrip("\ufeff")
-    # Source-side furigana must not be exposed by metadata fallback output.
-    compact = _strip_inline_pronunciation_annotations(compact)
+    compact = marketing_display_text(
+        re.sub(r"\s+", " ", str(novel.full_text or story_material or "")).strip()
+    )
     compact = re.sub(r"(?:标题|简介)\s*[:：]\s*", "", compact)
     compact = re.sub(
         r"^第\s*[0-9零〇一二两兩三四五六七八九十百千]+\s*[章节回话話卷集部篇]\s*[:：、.．\-—]*\s*",
@@ -6224,184 +6088,51 @@ def _fallback_marketing_candidates(
     if compact.startswith(clean_title):
         compact = compact[len(clean_title):].strip()
     sentences = [x.strip() for x in re.split(r"(?<=[。！？!?])", compact) if x.strip()]
-    seeds = sentences[:3] or [clean_title]
+    seeds = sentences[:rules["title_count"]] or [clean_title]
     titles = []
-    if is_three_kingdoms and sentences:
-        # Recovery titles for history stay entirely source-derived.  Rotate
-        # complete evidence sentences so that all three candidates meet the
-        # configured length without generic claims or truncated clauses.
-        for index in range(3):
-            parts = []
-            for offset in range(len(sentences)):
-                sentence = _candidate_title(sentences[(index + offset) % len(sentences)])
-                if sentence and sentence not in parts:
-                    parts.append(sentence)
-                value = _complete_title_within_limit("――".join(parts), max_chars)
-                if value and len(value) >= min_chars:
-                    break
-            if value and len(value) >= min_chars and value not in titles:
-                titles.append(value)
-    else:
-        for index in range(3):
-            seed = seeds[index % len(seeds)]
-            value = _candidate_title(seed) or clean_title
-            value = re.sub(r"[\r\n]+", " ", value).strip()
-            # Marketing titles have a configured minimum length.  Extend with
-            # neighbouring source sentences, then a neutral source-safe suffix.
-            next_seed = seeds[(index + 1) % len(seeds)]
-            while len(value) < min_chars and next_seed:
-                value = f"{value}――{_candidate_title(next_seed)}"
-                next_seed = ""
-            if len(value) < min_chars:
-                # A generic teaser such as "明かされる物語の真相" turns an
-                # historical episode into an invented, unfinished-sounding title.
-                # Preserve the source instead: combining complete neighbouring
-                # sentences is less promotional, but it is factual and readable.
-                source_tail = sentences[-1] if sentences else ""
-                if source_tail and source_tail not in value:
-                    value = f"{value}――{_candidate_title(source_tail)}"
-            value = _complete_title_within_limit(value, max_chars)
-            while len(value) < min_chars:
-                candidate = _complete_title_within_limit(value + "――逆転の結末へ。", max_chars)
-                if not candidate or candidate == value:
-                    break
-                value = candidate
-            if value in titles:
-                alternative = _complete_title_within_limit(value + f"――転機{index + 1}。", max_chars)
-                if alternative:
-                    value = alternative
-            titles.append(value)
+    for index in range(rules["title_count"]):
+        value = marketing_display_text(_candidate_title(seeds[index % len(seeds)]) or clean_title)
+        value = re.sub(r"[\r\n]+", " ", value).strip()
+        if value in titles:
+            value = next(
+                (
+                    marketing_display_text(_candidate_title(candidate))
+                    for candidate in sentences
+                    if _candidate_title(candidate) and marketing_display_text(_candidate_title(candidate)) not in titles
+                ),
+                value,
+            )
+        if value in titles:
+            value = f"{value}――転機{index + 1}。"
+        titles.append(value)
 
     def synopsis_from(rows: list[str]) -> str:
-        # Assemble whole sentences only.  Raw character slicing previously
-        # leaked source excerpts into a missing-synopsis fallback.
-        pool = [_candidate_synopsis(row) for row in rows if _candidate_synopsis(row)]
-        if not pool:
-            pool = sentences or [_candidate_synopsis(compact) or clean_title]
-        selected: list[str] = []
-        for sentence in pool:
-            candidate = "".join(selected + [sentence])
-            if selected and len(candidate) > 160:
-                break
-            if len(candidate) <= 160:
-                selected.append(sentence)
-            if len("".join(selected)) >= 80:
-                break
-        value = "".join(selected).strip()
-        if len(value) < 80:
-            for sentence in sentences:
-                if sentence in selected:
-                    continue
-                candidate = value + sentence
-                if len(candidate) > 160:
-                    break
-                value = candidate
-                if len(value) >= 80:
-                    break
-        # Very short or punctuation-free imports cannot provide enough source
-        # sentences for YouTube's synopsis minimum.  Use neutral, non-plot
-        # padding instead of cutting a source fragment in the middle.
-        neutral_extensions = (
-            "物語の中で重なる出来事と登場人物たちの選択が、これからの運命を大きく動かしていく。",
-            "まだ明かされていない事情を抱えながら、それぞれの思いが交差していく。",
-            "その先にある結末が注目される。",
-        )
-        for extension in neutral_extensions:
-            if len(value) >= 80 or len(value) + len(extension) > 160:
-                break
-            value += extension
-        value = value or clean_title
-        if value and value[-1] not in "。！？!?」』…":
-            value = value.rstrip("、，;；:： ") + "。"
-        return value[:160].rstrip()
+        return marketing_display_text(_candidate_synopsis("".join(rows)) or compact or clean_title)
 
-    synopsis = synopsis_from(sentences[:4])
-    synopsis2 = synopsis_from(sentences[-4:])
-    titles = _repair_fallback_marketing_titles(titles, min_chars, max_chars, language)
-    tags = _fallback_marketing_tags(novel, story_material, language)
-    return {"titles": titles, "synopses": [synopsis, synopsis2], "tags": tags, "tag_line": "".join(tags)}
-
-
-def _repair_fallback_marketing_titles(
-    titles: list[str], min_chars: int, max_chars: int, language: str,
-) -> list[str]:
-    """Make deterministic fallback titles pass the rules enforced below.
-
-    The fallback is the last recovery path after the text service is unavailable,
-    so it must not manufacture output which its own validator immediately rejects.
-    """
-    episode_marker = re.compile(
-        r"第\s*[0-9０-９零〇一二两兩三四五六七八九十百千]+\s*"
-        r"(?:话|話|集|回|章|篇|部|期)\s*[:：、.．\-—]*\s*"
+    synopses = [
+        synopsis_from(sentences[:4] if index % 2 == 0 else sentences[-4:])
+        for index in range(rules["synopsis_count"])
+    ]
+    tags = _candidate_tags(
+        _fallback_marketing_tags(novel, story_material, language),
+        rules["tag_max_count"],
     )
-    incomplete_ja = re.compile(r"(?:が|を|に|へ|で|と|の|は|も|から|ので|ながら|すると|そして|、|，|：|:|――)$")
-    suffixes = (
-        ("――物語が動き出す。", "――運命が変わる。", "――選択の結末。")
-        if language != "zh" else
-        ("——故事由此展开。", "——命运迎来转折。", "——最终抉择揭晓。")
-    )
-    repaired: list[str] = []
-    for index in range(3):
-        value = _candidate_title(titles[index] if index < len(titles) else "")
-        value = episode_marker.sub("", value).strip(" 　、，,:：――-—")
-        suffix = suffixes[index]
-        needs_completion = not value or (language != "zh" and incomplete_ja.search(value))
-        if needs_completion or len(value) < min_chars or value in repaired:
-            room = max(1, max_chars - len(suffix))
-            stem = value[:room].rstrip(" 　、，,:：――-—")
-            value = stem + suffix
-        if len(value) > max_chars:
-            value = _complete_title_within_limit(value, max_chars)
-        if len(value) < min_chars:
-            padding = suffixes[(index + 1) % len(suffixes)]
-            room = max(1, max_chars - len(padding))
-            value = value[:room].rstrip(" 　、，,:：――-—") + padding
-        if value in repaired:
-            unique_suffix = f"――転機{index + 1}。" if language != "zh" else f"——转折{index + 1}。"
-            room = max(1, max_chars - len(unique_suffix))
-            value = value[:room].rstrip(" 　、，,:：――-—") + unique_suffix
-        repaired.append(value)
-    # Source openings are often repeated (chapter headers are a common case),
-    # which can leave one complete candidate wholly contained in another.
-    # Rebuild all three to the same source stem plus clearly distinct endings.
-    if _marketing_title_style_error({"titles": repaired}, language):
-        distinct_suffixes = (
-            (
-                "――すべてを失った主人公が新たな出会いを重ね、追放の先で自分の運命を切り開いていく物語。",
-                "――隠されていた過去の真実と意外な選択が明らかになり、止まっていた未来が大きく動き始める。",
-                "――絶望の底から立ち上がった主人公が数々の困難を乗り越え、かけがえのない居場所を取り戻す。",
-            )
-            if language != "zh" else
-            (
-                "——失去一切的主人公经历新的相遇，在逆境之中一步步开辟属于自己的命运。",
-                "——被掩盖的往事和意外抉择终于揭晓，让原本停滞的未来重新发生巨大转折。",
-                "——从绝望中重新站起的主人公跨越重重困境，最终夺回了无可替代的归宿。",
-            )
-        )
-        stem = episode_marker.sub("", repaired[0].split("――", 1)[0]).strip(" 　、，,:：――-—")
-        if language != "zh":
-            stem = incomplete_ja.sub("", stem).rstrip(" 　、，,:：――-—")
-        rebuilt = []
-        for suffix in distinct_suffixes:
-            room = max(1, max_chars - len(suffix))
-            value = stem[:room].rstrip(" 　、，,:：――-—") + suffix
-            rebuilt.append(value)
-        repaired = rebuilt
-    return repaired
+    return {"titles": titles, "synopses": synopses, "tags": tags, "tag_line": "".join(tags)}
 
 
 def _write_marketing_candidates_text(path: Path, bundle: dict, language: str = "ja") -> None:
-    titles = list(bundle.get("titles") or [])[:3]
-    synopses = list(bundle.get("synopses") or [])[:2]
+    rules = _marketing_contract()
+    titles = [marketing_display_text(str(value)) for value in list(bundle.get("titles") or [])[:rules["title_count"]]]
+    synopses = [marketing_display_text(str(value)) for value in list(bundle.get("synopses") or [])[:rules["synopsis_count"]]]
     if language == "zh":
         title_heading, synopsis_heading, tag_heading = "【视频标题】", "【简介】", "【标签候选】"
     else:
         title_heading, synopsis_heading, tag_heading = "【動画タイトル】", "【あらすじ】", "【タグ候補】"
     rows = [title_heading, ""]
-    rows.extend(f"{label}{value}" for label, value in zip(("①", "②", "③"), titles))
+    rows.extend(f"{index}. {value}" for index, value in enumerate(titles, start=1))
     rows.extend(["", synopsis_heading, ""])
-    rows.extend(f"{label}{value}" for label, value in zip(("①", "②"), synopses))
-    tags = _candidate_tags(bundle.get("tags") or bundle.get("tag_line") or [])
+    rows.extend(f"{index}. {value}" for index, value in enumerate(synopses, start=1))
+    tags = _candidate_tags(bundle.get("tags") or bundle.get("tag_line") or [], rules["tag_max_count"])
     if tags:
         rows.extend(["", tag_heading, "", "".join(tags)])
     short_script = str(bundle.get("short_script") or "").strip()
@@ -6414,45 +6145,34 @@ def _write_marketing_candidates_text(path: Path, bundle: dict, language: str = "
 def _metadata_has_marketing_candidates(metadata: dict | None) -> bool:
     data = metadata if isinstance(metadata, dict) else {}
     bundle = {
-        "titles": [_candidate_title(x) for x in data.get("titles", [])] if isinstance(data.get("titles"), list) else [],
-        "synopses": [_candidate_synopsis(x) for x in data.get("synopses", [])] if isinstance(data.get("synopses"), list) else [],
+        "titles": [marketing_display_text(_candidate_title(x)) for x in data.get("titles", [])] if isinstance(data.get("titles"), list) else [],
+        "synopses": [marketing_display_text(_candidate_synopsis(x)) for x in data.get("synopses", [])] if isinstance(data.get("synopses"), list) else [],
         "tags": _candidate_tags(data.get("generated_tags") or data.get("generated_tag_line") or data.get("tags") or ""),
     }
-    min_chars = max(20, int(config.get("marketing_title_min_chars", 40) or 40))
-    max_chars = max(min_chars, int(config.get("marketing_title_max_chars", 70) or 70))
-    return not _marketing_validation_error(bundle, min_chars, max_chars)
+    return not _marketing_validation_error(bundle)
 
 
 def _metadata_has_valid_marketing_titles(metadata: dict | None) -> bool:
     """Check title safety before a manual upload can reach YouTube."""
     data = metadata if isinstance(metadata, dict) else {}
-    titles = [_candidate_title(x) for x in data.get("titles", [])] if isinstance(data.get("titles"), list) else []
-    min_chars = max(20, int(config.get("marketing_title_min_chars", 40) or 40))
-    max_chars = max(min_chars, int(config.get("marketing_title_max_chars", 70) or 70))
+    titles = [marketing_display_text(_candidate_title(x)) for x in data.get("titles", [])] if isinstance(data.get("titles"), list) else []
+    rules = _marketing_contract()
     return (
-        len(titles) == 3
-        and len(set(titles)) == 3
-        and all(min_chars <= len(title) <= max_chars and not _contains_marketing_source_wrapper(title) for title in titles)
+        len(titles) == rules["title_count"]
+        and len(set(titles)) == rules["title_count"]
+        and all(not _contains_marketing_source_wrapper(title) for title in titles)
     )
 
 
 def _marketing_title_upload_error(metadata: dict | None) -> str:
     """Explain the upload-only title checks without blaming valid copy."""
     data = metadata if isinstance(metadata, dict) else {}
-    titles = [_candidate_title(x) for x in data.get("titles", [])] if isinstance(data.get("titles"), list) else []
-    min_chars = max(20, int(config.get("marketing_title_min_chars", 40) or 40))
-    max_chars = max(min_chars, int(config.get("marketing_title_max_chars", 70) or 70))
-    if len(titles) != 3:
-        return f"标题候选数量不正确：当前 {len(titles)} 条，需要 3 条。"
+    titles = [marketing_display_text(_candidate_title(x)) for x in data.get("titles", [])] if isinstance(data.get("titles"), list) else []
+    rules = _marketing_contract()
+    if len(titles) != rules["title_count"]:
+        return f"标题候选数量不正确：当前 {len(titles)} 条，需要 {rules['title_count']} 条。"
     if len(set(titles)) != len(titles):
-        return "标题候选重复：3 条标题必须各不相同。"
-    invalid_lengths = [f"第{index}条 {len(title)} 字" for index, title in enumerate(titles, start=1)
-                       if len(title) < min_chars or len(title) > max_chars]
-    if invalid_lengths:
-        return (
-            f"标题候选字数不符合当前设置（要求每条 {min_chars}–{max_chars} 字；"
-            f"{'、'.join(invalid_lengths)}）。请重新生成，或在设置中调整候选标题字数范围。"
-        )
+        return f"标题候选重复：{rules['title_count']} 条标题必须各不相同。"
     if any(_contains_marketing_source_wrapper(title) for title in titles):
         return "标题候选含有“标题：”“简介：”或“local text input”等内部任务文字，已阻止上传。"
     return "标题候选无效，已阻止上传。"
@@ -6521,31 +6241,29 @@ def _persist_series_marketing_short_title(job_dir: Path, short_name: str) -> str
     return clean
 
 
-def _apply_series_marketing_label(bundle: dict, label: str, max_chars: int) -> dict:
+def _apply_series_marketing_label(bundle: dict, label: str) -> dict:
     if not label:
         return bundle
     titles = []
-    for raw in list(bundle.get("titles") or [])[:3]:
-        title = _candidate_title(raw)
+    for raw in list(bundle.get("titles") or [])[:_marketing_contract()["title_count"]]:
+        title = marketing_display_text(_candidate_title(raw))
         title = re.sub(r"^(?:【[^】]+】|[^｜]{1,24}｜(?:上篇|下篇|第\d+話)｜)\s*", "", title)
-        available = max(1, max_chars - len(label))
-        title = title[:available].rstrip("、。！？!?｜ ")
         titles.append(f"{label}｜{title}")
     bundle = dict(bundle)
     bundle["titles"] = titles
     return bundle
 
 
-def _fit_marketing_title_lengths(bundle: dict, max_chars: int) -> dict:
-    """Normalize model wrappers without silently cutting a sentence in half.
-
-    Length enforcement belongs to validation/retry.  Slicing here used to
-    turn an otherwise complete Japanese title into fragments such as ``今さ``.
-    """
+def _normalize_marketing_candidates(bundle: dict) -> dict:
+    """Normalize visible marketing text without imposing a character limit."""
     bundle = dict(bundle)
     bundle["titles"] = [
-        _candidate_title(value)
-        for value in list(bundle.get("titles") or [])[:3]
+        marketing_display_text(_candidate_title(value))
+        for value in list(bundle.get("titles") or [])[:_marketing_contract()["title_count"]]
+    ]
+    bundle["synopses"] = [
+        marketing_display_text(_candidate_synopsis(value))
+        for value in list(bundle.get("synopses") or [])[:_marketing_contract()["synopsis_count"]]
     ]
     return bundle
 
@@ -6643,7 +6361,7 @@ def _series_short_name_from_existing_titles(
             provider=route["provider"], base_url=route["base_url"], api_key=route["api_key"], model=route["model"],
             system_prompt="Return JSON only.", temperature=0.25, max_tokens=180, timeout=90.0,
         )
-    series_titles = list(dict.fromkeys(str(value).strip() for value in titles if str(value).strip()))[:3]
+    series_titles = list(dict.fromkeys(str(value).strip() for value in titles if str(value).strip()))
     request = (
         "以下は同じ小説シリーズで最初に制作開始された1本の動画タイトルです。この1本の内容を根拠に、"
         "今後のシリーズ全話で共有できる、CTRを意識した"
@@ -6761,6 +6479,38 @@ def apply_series_presentation(metadata: dict, job_dir: Path, on_log: LogFn = _no
     return data
 
 
+def _marketing_story_material(
+    novel: Novel,
+    segments: list[Segment],
+    job_dir: Path,
+    max_chars: int,
+) -> tuple[str, str]:
+    """Return marketing evidence from the final rewritten task text when present."""
+    rewritten_path = job_dir / "text_rewritten.txt"
+    rewritten = (
+        rewritten_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if rewritten_path.is_file()
+        else ""
+    )
+    if rewritten:
+        rewritten_novel = Novel(
+            site=novel.site,
+            novel_id=novel.novel_id,
+            title=novel.title,
+            author=novel.author,
+            description=novel.description,
+            chapters=[NovelChapter(index=1, title="", text=rewritten)],
+        )
+        return (
+            sampled_story_input(rewritten_novel, [], max_chars),
+            sampled_story_input(rewritten_novel, [], max_chars, expand_to_limit=True),
+        )
+    return (
+        sampled_story_input(novel, segments, max_chars),
+        sampled_story_input(novel, segments, max_chars, expand_to_limit=True),
+    )
+
+
 def stage_metadata(
     novel: Novel,
     job_dir: Path,
@@ -6768,71 +6518,46 @@ def stage_metadata(
     segments: list[Segment] | None = None,
     on_log: LogFn = _noop,
 ) -> dict:
-    intro = _metadata_intro(novel, story_context)
-    clean_title = _clean_display_title(novel.title)
+    rules = _marketing_contract()
+    display_story_context = _marketing_display_value(story_context or {})
+    intro = marketing_display_text(_metadata_intro(novel, story_context))
+    clean_title = marketing_display_text(_clean_display_title(novel.title))
     series_settings = series_video_settings_for_job(job_dir)
     ai_episode_title_enabled = bool(
         series_settings.get("ai_episode_title_enabled", True)
     )
-    min_chars = max(20, int(config.get("marketing_title_min_chars", 40) or 40))
-    max_chars = max(min_chars, int(config.get("marketing_title_max_chars", 70) or 70))
     prebuild_short_script = bool(config.get("short_video_prebuild_script_enabled", False))
     short_script_max_chars = max(
         50,
         min(2000, int(config.get("short_video_script_max_chars", 350) or 350)),
     )
-    story_material = sampled_story_input(
+    story_material, expanded_story_material = _marketing_story_material(
         novel,
         list(segments or []),
+        job_dir,
         int(config.get("storyboard_highlight_context_max_chars", 10000) or 10000),
     )
-    expanded_story_material = sampled_story_input(
-        novel,
-        list(segments or []),
-        int(config.get("storyboard_highlight_context_max_chars", 10000) or 10000),
-        expand_to_limit=True,
-    )
+    story_material = marketing_display_text(story_material)
+    expanded_story_material = marketing_display_text(expanded_story_material)
     route = _llm_route_settings()
     prompt = str(config.get("marketing_candidates_prompt", "") or "").strip()
     marketing_language = _configured_text_language(prompt)
     short_script_prompt = str(config.get("short_video_script_prompt", "") or "").strip()
     short_script_language = _configured_text_language(short_script_prompt)
-    # Keep the editable prompt and the numeric settings on one source of
-    # truth.  Profiles may have been saved with any previous numeric range.
-    # The GUI values are authoritative, so never send conflicting limits to
-    # the text API.
-    prompt = re.sub(
-        r"各\s*\d+\s*[〜～-]\s*\d+\s*文字(?:程度)?",
-        f"各{min_chars}〜{max_chars}文字程度",
-        prompt,
-    )
-    prompt = re.sub(
-        r"每(?:个|条)?(?:约|严格为)?\s*\d+\s*[—–－〜～-]\s*\d+\s*(?:个)?(?:汉字|字符)",
-        f"每个严格为{min_chars}—{max_chars}个字符",
-        prompt,
-    )
     if marketing_language == "zh":
         prompt += (
-            f"\n\n【运行时最高优先级字数规则】必须生成3条完整视频标题，每条严格为{min_chars}—{max_chars}个字符，"
-            "标点和书名号也计入字符数。建议把正文写到区间中部，不要贴着最低字数。"
-            f"输出JSON前逐条重新计数；任何一条少于{min_chars}字或超过{max_chars}字，都必须先重写再输出。"
-            "不得截断句子，必须在语义完整的位置收尾，程序不会替模型裁切标题。"
-            "标题、简介、标签和Short文案全部使用自然简体中文。"
-            "三条标题中至少两条必须是有叙事推进的陈述句；疑问式标题最多一条，"
-            "不得三条都用‘为何、为什么、究竟、如何、谁才是’等问号钩子。"
+            "\n\n【运行时输出结构】必须只返回一个 JSON 对象，包含"
+            f"{rules['title_count']}条标题、{rules['synopsis_count']}条简介和"
+            f"{rules['tag_min_count']}–{rules['tag_max_count']}个标签。"
+            f"JSON 形状：{_marketing_json_shape(rules, marketing_language)}"
         )
     else:
         prompt += (
-            f"\n\n【実行時の最優先文字数ルール】動画タイトル3案は各{min_chars}〜{max_chars}文字。"
-            "範囲の中央付近を目標にし、出力前に各案を数え直してください。"
-            "この範囲を超えるタイトルは返さず、文の途中で切らず、句読点または意味の完結する位置で"
-            "内容を組み直してください。プログラム側でタイトルを途中切断することはありません。"
+            "\n\n【実行時の出力構造】JSONオブジェクトだけを返し、"
+            f"タイトル{rules['title_count']}件・あらすじ{rules['synopsis_count']}件・"
+            f"内容一致タグ{rules['tag_min_count']}〜{rules['tag_max_count']}個を含めてください。"
+            f"JSON形式：{_marketing_json_shape(rules, marketing_language)}"
         )
-    prompt += (
-        "\n\n【重複禁止】候補タイトル本文には、第○話・第○集・第○回・第○章・第○篇などの"
-        "話数／章番号、話数の範囲、シリーズ名を一切入れないでください。これらはアップロード時に"
-        "プログラムが一度だけ付加します。タイトルは接続詞・助詞・読点の途中で終えず、必ず一文として完結させてください。"
-    )
     if _is_three_kingdoms_material(novel.title, novel.full_text, story_material):
         if marketing_language == "zh":
             prompt += (
@@ -6843,8 +6568,8 @@ def stage_metadata(
                 "用破折号拼接诗句，或用‘真相即将揭晓’‘付出惨痛代价’‘震撼结局’等空泛套话凑字数。"
                 "生成前必须综合阅读开头、中段、结尾，不得只抓开头一句。若资料涉及正史、《三国演义》、"
                 "民间说书、后世评点或改编，必须保留各自边界，不得混写成同一史实。"
-                "三案固定分工：第一案为人物行动＋事件后果的陈述式说书标题；第二案为人物关系、计谋或战局逆转的"
-                "陈述式标题；第三案为历史背景、文本流变或后世影响，只有确有未解事实时才允许使用疑问句。"
+                "每条标题都必须从不同的事实切入，优先人物行动、人物关系、计谋、战局、历史背景或文本流变；"
+                "只有确有未解事实时才允许使用疑问句。"
                 "不得把‘三国志完全解说’、第几话、作品名或资料标签重复写进候选标题正文。"
             )
         else:
@@ -6882,14 +6607,13 @@ def stage_metadata(
                 f"\"short_script\":\"最大{short_script_max_chars}文字の完成ナレーション\"を含めてください。"
             )
     input_hash = _stable_hash({
-        "schema": "marketing_candidates_v4_no_fallback_source_text",
+        "schema": "marketing_candidates_v5_configurable_contract",
         "source": story_material,
-        "story_context": story_context or {},
+        "story_context": display_story_context,
         "provider": route["provider"],
         "model": route["model"],
         "prompt": prompt,
-        "min_chars": min_chars,
-        "max_chars": max_chars,
+        "contract": rules,
         "ai_episode_title_enabled": ai_episode_title_enabled,
         "prebuild_short_script": prebuild_short_script,
         "short_script_max_chars": short_script_max_chars,
@@ -6901,10 +6625,10 @@ def stage_metadata(
     if isinstance(cached, dict) and cached.get("input_hash") == input_hash:
         try:
             candidate = _parse_marketing_candidates(cached)
-            candidate = _fit_marketing_title_lengths(candidate, max_chars)
+            candidate = _normalize_marketing_candidates(candidate)
             candidate["short_script"] = _clean_prebuilt_short_script(candidate.get("short_script", ""), short_script_max_chars)
             cached_marketing_error = (
-                _marketing_validation_error(candidate, min_chars, max_chars)
+                _marketing_validation_error(candidate, rules)
                 or _marketing_topic_error(candidate, novel.title, story_material)
                 or _marketing_title_style_error(candidate, marketing_language)
             )
@@ -6916,13 +6640,14 @@ def stage_metadata(
                     candidate["short_script"] = ""
                     on_log("  WARN 缓存标题和简介有效；Short文案将在Short阶段单独重新生成")
                 bundle = candidate
-                on_log("  reuse 3 title / 2 synopsis marketing candidates")
+                on_log(
+                    f"  reuse {rules['title_count']} title / "
+                    f"{rules['synopsis_count']} synopsis marketing candidates"
+                )
         except Exception:
             bundle = {}
     raw_output = ""
     validation_error = ""
-    last_candidate: dict = {}
-    fallback_used = False
     generation_attempts = 0
     try:
         max_generation_attempts = int(config.get("marketing_candidates_retry_attempts", 5) or 5)
@@ -6935,15 +6660,6 @@ def stage_metadata(
     if bool(config.get("short_title_enabled", True)) and ai_episode_title_enabled:
         if not bundle and _can_call_text_llm():
             try:
-                configured_max_tokens = max(
-                    400, int(config.get("marketing_candidates_max_tokens", 1600) or 1600)
-                )
-                # GPT-5-family reasoning models may use a large part of this
-                # allowance internally before producing the requested JSON.
-                # Preserve the user's larger value, but avoid a known-empty
-                # 1,600-token first attempt for these models.
-                reasoning_model = str(route.get("model") or "").lower().startswith("gpt-5")
-                base_max_tokens = max(configured_max_tokens, 3200 if reasoning_model else 400)
                 llm = LLMBackend(
                     provider=route["provider"],
                     base_url=route["base_url"],
@@ -6952,20 +6668,15 @@ def stage_metadata(
                     system_prompt=prompt,
                     style_suffix="",
                     temperature=0.7,
-                    max_tokens=base_max_tokens,
+                    max_tokens=int(config.get("marketing_candidates_max_tokens", 1600) or 1600),
                     timeout=180.0,
-                )
-                on_log(
-                    "  title text route: "
-                    f"base={route['base_url']} model={route['model']} "
-                    f"initial_max_tokens={base_max_tokens}"
                 )
                 if marketing_language == "zh":
                     request_head = (
                         "以下是作品标题，以及从开头、中段和结尾抽取的事实资料。"
                         "请综合全部资料，只返回指定JSON。\n\n"
                         f"作品标题（仅供核对事实，不要照抄进标题）：{clean_title}\n"
-                        f"已有全篇简报：{json.dumps(story_context or {}, ensure_ascii=False)}\n\n"
+                        f"已有全篇简报：{json.dumps(display_story_context, ensure_ascii=False)}\n\n"
                         "开头、中段、结尾资料：\n"
                     )
                 else:
@@ -6973,16 +6684,11 @@ def stage_metadata(
                         "以下は作品のタイトルと、冒頭・中盤・終盤から抽出した事実資料です。"
                         "この資料全体を根拠に、指定JSONだけを返してください。\n\n"
                         f"作品タイトル（事実確認用。出力しない）：{clean_title}\n"
-                        f"既存の全体簡報：{json.dumps(story_context or {}, ensure_ascii=False)}\n\n"
+                        f"既存の全体簡報：{json.dumps(display_story_context, ensure_ascii=False)}\n\n"
                         "冒頭・中盤・終盤の資料：\n"
                     )
                 for attempt in range(max_generation_attempts):
                     generation_attempts = attempt + 1
-                    # Complex title bundles need substantially more visible
-                    # output budget on reasoning-capable models.  Repeating the
-                    # same exhausted 1,600-token request five times cannot
-                    # recover, so increase only after a failed attempt.
-                    attempt_max_tokens = min(8000, base_max_tokens * (attempt + 1))
                     # Start economical (about 2,000 chars × three samples).
                     # If that result is unusable, retries receive the full
                     # configured evidence cap rather than repeating it.
@@ -6993,42 +6699,39 @@ def stage_metadata(
                             on_log(
                                 "  WARN 标题接口未返回 JSON，"
                                 f"等待 {retry_delay_seconds:.0f}s 后自动重试 "
-                                f"({attempt + 1}/{max_generation_attempts}, "
-                                f"max_tokens={attempt_max_tokens})..."
+                                f"({attempt + 1}/{max_generation_attempts})..."
                             )
                             time.sleep(retry_delay_seconds)
                         if marketing_language == "zh":
                             retry_note = (
                                 f"\n\n上次输出未通过严格检查：{validation_error}。"
-                                f"请重写不合格项目。3条标题必须逐条数到{min_chars}—{max_chars}字，"
-                                "不要只做同义替换后再次返回相同长度；建议每条写到45—60字。"
-                                "必须包含3条标题、2条简介和10—15个内容匹配标签，只返回一行正确JSON。"
+                                f"必须包含{rules['title_count']}条标题、{rules['synopsis_count']}条简介和"
+                                f"{rules['tag_min_count']}–{rules['tag_max_count']}个内容匹配标签，只返回一行正确JSON。"
                                 "绝对不要把‘标题’‘简介’‘local text input’‘[开头]’等内部标签写进标题。"
                             )
-                    else:
-                        retry_note = (
+                        else:
+                            retry_note = (
                                 f"\n\n前回の出力は形式検査に失敗しました：{validation_error}。"
-                                "内容を作り直し、3タイトル・2あらすじ・10〜15個の内容一致タグを含む正しいJSONだけを一行で返してください。"
+                                f"内容を作り直し、{rules['title_count']}タイトル・{rules['synopsis_count']}あらすじ・"
+                                f"{rules['tag_min_count']}〜{rules['tag_max_count']}個の内容一致タグを含む正しいJSONだけを一行で返してください。"
                                 "入力内の「标题」「简介」「local text input」「[开头]」等の内部ラベルをタイトルへ絶対に写さないでください。"
                                 "【朗読・小説】と#赤陽の勧めるノベルは使用しないでください。"
                             )
-                    raw_output = ""
                     try:
                         with external_api_slot(action="marketing candidates"):
                             raw_output = llm.complete(
                                 prompt,
                                 request_head + material_for_attempt + retry_note,
-                                max_tokens=attempt_max_tokens,
+                                max_tokens=int(config.get("marketing_candidates_max_tokens", 1600) or 1600),
                                 temperature=0.7,
                             ).strip()
                         candidate = _parse_marketing_candidates(raw_output)
-                        candidate = _fit_marketing_title_lengths(candidate, max_chars)
+                        candidate = _normalize_marketing_candidates(candidate)
                         candidate["short_script"] = _clean_prebuilt_short_script(
                             candidate.get("short_script", ""), short_script_max_chars
                         )
-                        last_candidate = candidate
                         marketing_error = (
-                            _marketing_validation_error(candidate, min_chars, max_chars)
+                            _marketing_validation_error(candidate, rules)
                             or _marketing_topic_error(candidate, novel.title, story_material)
                             or _marketing_title_style_error(candidate, marketing_language)
                         )
@@ -7047,71 +6750,17 @@ def stage_metadata(
                     except Exception as exc:
                         candidate = {}
                         validation_error = str(exc)
-                        preview = re.sub(r"\s+", " ", str(raw_output or "")).strip()[:240]
-                        if preview:
-                            on_log(
-                                "  WARN 标题响应解析失败："
-                                f"{redact_secret_text(validation_error)}；"
-                                f"响应预览={redact_secret_text(preview)}"
-                            )
-                        else:
-                            on_log(
-                                "  WARN 标题响应为空或请求失败："
-                                + redact_secret_text(validation_error)
-                            )
                     if bundle:
                         break
             except Exception as exc:
                 on_log(f"  WARN marketing candidate LLM failed: {redact_secret_text(exc)}; use grounded fallback")
     if not bundle:
-        fallback_used = True
         message = validation_error or "text LLM unavailable or did not return a valid bundle"
-        fallback_bundle = _fallback_marketing_candidates(
-            novel, story_material, min_chars, max_chars, marketing_language
-        )
-        # Do not discard a good model response merely because one field is
-        # missing.  Some OpenAI-compatible reasoning routes reliably return
-        # three strong titles and tags but only one synopsis.  Preserve every
-        # independently valid model field and fill only the missing pieces
-        # from the deterministic source-derived fallback.
-        candidate_titles = list(last_candidate.get("titles") or [])
-        title_probe = {
-            "titles": candidate_titles,
-            "synopses": fallback_bundle["synopses"],
-            "tags": list(last_candidate.get("tags") or fallback_bundle["tags"]),
-        }
-        titles_are_valid = not (
-            _marketing_validation_error(title_probe, min_chars, max_chars)
-            or _marketing_topic_error(title_probe, novel.title, story_material)
-            or _marketing_title_style_error(title_probe, marketing_language)
-        )
-        candidate_synopses = [
-            value for value in list(last_candidate.get("synopses") or [])
-            if 80 <= len(str(value or "")) <= 160
-        ]
-        merged_synopses = list(dict.fromkeys(candidate_synopses))
-        for value in fallback_bundle["synopses"]:
-            if value not in merged_synopses:
-                merged_synopses.append(value)
-            if len(merged_synopses) >= 2:
-                break
-        candidate_tags = list(last_candidate.get("tags") or [])
-        tags_are_valid = 10 <= len(candidate_tags) <= 15
-        bundle = {
-            "titles": candidate_titles if titles_are_valid else fallback_bundle["titles"],
-            "synopses": merged_synopses[:2],
-            "tags": candidate_tags if tags_are_valid else fallback_bundle["tags"],
-            "tag_line": "",
-            "short_script": str(last_candidate.get("short_script") or ""),
-        }
-        bundle["tag_line"] = "".join(bundle["tags"])
-        partial_model_repair = bool(last_candidate) and (
-            bundle["titles"] == candidate_titles
-            or bundle["tags"] == candidate_tags
-            or bool(candidate_synopses)
+        bundle = _fallback_marketing_candidates(
+            novel, story_material, marketing_language, rules
         )
         fallback_error = (
-            _marketing_validation_error(bundle, min_chars, max_chars)
+            _marketing_validation_error(bundle, rules)
             or _marketing_topic_error(bundle, novel.title, story_material)
             or _marketing_title_style_error(bundle, marketing_language)
         )
@@ -7129,16 +6778,10 @@ def stage_metadata(
         if not ai_episode_title_enabled:
             on_log("  series setting disabled AI episode titles; using local source-derived titles")
         else:
-            if partial_model_repair:
-                on_log(
-                    "  WARN 标题接口返回字段不完整；已保留合格模型内容并仅用本地资料补齐缺项："
-                    + redact_secret_text(message)
-                )
-            else:
-                on_log(
-                    "  WARN 标题接口格式异常；已使用本地保底标题继续任务："
-                    + redact_secret_text(message)
-                )
+            on_log(
+                "  WARN 标题接口格式异常；已使用本地保底标题继续任务："
+                + redact_secret_text(message)
+            )
 
     bundle_record = {
         "schema_version": 2,
@@ -7148,13 +6791,7 @@ def stage_metadata(
         "tags": bundle["tags"],
         "tag_line": bundle["tag_line"],
         "generation_attempts": generation_attempts,
-        # The saved bundle has passed final validation.  Keep the upstream
-        # defect as provenance without incorrectly marking the repaired file
-        # itself invalid or blocking upload.
-        "validation_warning": "",
-        "generation_warning": validation_error if fallback_used else "",
-        "fallback_used": fallback_used,
-        "attention_required": False,
+        "validation_warning": validation_error,
         "raw_model_output": raw_output,
         "short_script": str(bundle.get("short_script") or ""),
         "short_script_max_chars": short_script_max_chars if prebuild_short_script else 0,
@@ -7254,17 +6891,6 @@ def _source_episode_label_from_job_name(job_name: str) -> str:
     return f"第{episode}话" if episode else ""
 
 
-def _template_uses_source_episode_range(template: str) -> bool:
-    """Whether a title template explicitly owns the source episode range.
-
-    A range is a complete, operator-facing series label (for example,
-    ``第228話～第230話``).  In that case the generic animated-series prefix
-    must not be added as well, otherwise one upload gets two different
-    episode labels.
-    """
-    return "{source_episode_range}" in str(template or "")
-
-
 def _limit_upload_title(text: str, max_chars: int = 100) -> str:
     title = re.sub(r"\s+", " ", str(text or "")).strip()
     limit = max(0, int(max_chars or 0))
@@ -7274,16 +6900,7 @@ def _limit_upload_title(text: str, max_chars: int = 100) -> str:
         if title.endswith(suffix) and limit > len(suffix) + 8:
             body = title[: limit - len(suffix)].rstrip(" ，。！？、,.!?;；:")
             return (body + suffix).strip()
-    prefix = title[:limit]
-    # CJK titles do not contain spaces where a safe word cut can be made.
-    # Prefer a completed clause rather than a raw character slice such as
-    # ``策を``.  A series separator is never a usable finishing point.
-    last_series_separator = prefix.rfind("｜")
-    boundaries = [prefix.rfind(mark) for mark in "。！？!?；;、，,：:"]
-    cut = max(boundaries, default=-1)
-    if cut > last_series_separator and cut >= max(last_series_separator + 8, int(limit * 0.45)):
-        return prefix[: cut + 1].rstrip(" 、，,：:")
-    return prefix.rstrip(" ，。！？、,.!?;；:")
+    return title[:limit].rstrip(" ，。！？、,.!?;；:")
 
 
 def _remove_disallowed_upload_tag(text: str) -> str:
@@ -7315,7 +6932,11 @@ def _persistent_upload_candidate(
     metadata: dict,
 ) -> dict | None:
     titles_raw = metadata.get("titles") if isinstance(metadata.get("titles"), list) else []
-    titles = [_strip_series_part_prefix(x) for x in titles_raw if _strip_series_part_prefix(x)][:3]
+    titles = [
+        marketing_display_text(_strip_series_part_prefix(x))
+        for x in titles_raw
+        if _strip_series_part_prefix(x)
+    ][:_marketing_contract()["title_count"]]
     if not titles:
         return None
     candidate_hash = _stable_hash({
@@ -7358,7 +6979,11 @@ def _persistent_upload_synopsis(
 ) -> dict | None:
     """Choose one generated synopsis per upload profile and keep it on retries."""
     synopses_raw = metadata.get("synopses") if isinstance(metadata.get("synopses"), list) else []
-    synopses = [_candidate_synopsis(value) for value in synopses_raw if _candidate_synopsis(value)][:2]
+    synopses = [
+        marketing_display_text(_candidate_synopsis(value))
+        for value in synopses_raw
+        if _candidate_synopsis(value)
+    ][:_marketing_contract()["synopsis_count"]]
     if not synopses:
         return None
     candidate_hash = _stable_hash({"schema": "upload_synopsis_v1", "synopses": synopses})
@@ -7492,20 +7117,20 @@ def _cover_marketing_context(
     stage and reuses the story-context sampling, so this adds no API call.
     """
     data = metadata if isinstance(metadata, dict) else {}
-    title = _clean_short_title(str(data.get("short_title") or ""), 1, 80)
-    source_title = _clean_short_title(_clean_display_title(novel.title), 1, 80)
+    title = marketing_display_text(_candidate_title(str(data.get("short_title") or "")))
+    source_title = marketing_display_text(_candidate_title(_clean_display_title(novel.title)))
     if title and title == source_title:
         # A provider occasionally echoes the source title.  It is a useful
         # fact for title generation, but must never become the cover hook.
         title = ""
-    synopsis = re.sub(r"\s+", " ", str(data.get("intro") or "")).strip()
+    synopsis = marketing_display_text(re.sub(r"\s+", " ", str(data.get("intro") or "")).strip())
     if not synopsis:
         synopsis = _cover_excerpt(novel, segments)
     if not title:
         # Degraded/offline fallback: derive display text from story material,
         # deliberately never from novel.title (which is also the task name).
-        title = _clean_short_title(synopsis, 1, 30) or "物語の真相"
-    return title, synopsis[:900]
+        title = _candidate_title(synopsis) or "物語の真相"
+    return marketing_display_text(title), marketing_display_text(synopsis[:900])
 
 
 def _cover_marketing_bundle(
@@ -7515,15 +7140,15 @@ def _cover_marketing_bundle(
 ) -> dict:
     data = metadata if isinstance(metadata, dict) else {}
     if data.get("ai_cover_copy_enabled") is False:
-        manual_title = str(
+        manual_title = marketing_display_text(str(
             data.get("manual_cover_title")
             or data.get("series_cover_label")
             or data.get("series_short_title")
             or ""
-        ).strip()
-        synopsis = _candidate_synopsis(str(data.get("intro") or ""))
+        )).strip()
+        synopsis = marketing_display_text(_candidate_synopsis(str(data.get("intro") or "")))
         if not synopsis:
-            synopsis = _cover_excerpt(novel, segments)
+            synopsis = marketing_display_text(_cover_excerpt(novel, segments))
         return {
             "titles": [manual_title or "物語シリーズ"],
             "synopses": [synopsis],
@@ -7532,8 +7157,17 @@ def _cover_marketing_bundle(
         }
     titles_raw = data.get("titles") if isinstance(data.get("titles"), list) else []
     synopses_raw = data.get("synopses") if isinstance(data.get("synopses"), list) else []
-    titles = [_candidate_title(x) for x in titles_raw if _candidate_title(x)][:3]
-    synopses = [_candidate_synopsis(x) for x in synopses_raw if _candidate_synopsis(x)][:2]
+    rules = _marketing_contract()
+    titles = [
+        marketing_display_text(_candidate_title(x))
+        for x in titles_raw
+        if _candidate_title(x)
+    ][:rules["title_count"]]
+    synopses = [
+        marketing_display_text(_candidate_synopsis(x))
+        for x in synopses_raw
+        if _candidate_synopsis(x)
+    ][:rules["synopsis_count"]]
     if not titles or not synopses:
         legacy_title, legacy_synopsis = _cover_marketing_context(novel, segments, metadata)
         if not titles:
@@ -7614,23 +7248,23 @@ def _build_cover_prompt(
     bundle = _cover_marketing_bundle(novel, segments, metadata)
     title = str(bundle["titles"][0])
     excerpt = str(bundle["synopses"][0])
-    series_badge = (
+    series_badge = marketing_display_text(
         str((metadata or {}).get("series_cover_label") or "").strip()
-        if bool(config.get("series_animation_enabled", True))
-        else ""
-    )
+    ) if bool(config.get("series_animation_enabled", True)) else ""
     configured_series_badge = str(config.get("cover_series_label_template", "") or "").strip()
     if configured_series_badge:
-        series_badge = _format_template(
-            configured_series_badge,
-            {
-                "source_episode": _source_episode_from_job_name(novel.title),
-                "source_episode_range": _source_episode_range_from_job_name(novel.title),
-                "source_episode_label": _source_episode_label_from_job_name(novel.title),
-                "title": title,
-                "candidate_title": title,
-            },
-        ).strip()
+        series_badge = marketing_display_text(
+            _format_template(
+                configured_series_badge,
+                {
+                    "source_episode": _source_episode_from_job_name(novel.title),
+                    "source_episode_range": _source_episode_range_from_job_name(novel.title),
+                    "source_episode_label": _source_episode_label_from_job_name(novel.title),
+                    "title": title,
+                    "candidate_title": title,
+                },
+            ).strip()
+        )
     custom = str(config.get("cover_custom_prompt", "") or "").strip()
     style = str(config.llm_image_style_suffix or "").strip()
     # An explicitly typography-led editorial cover must not inherit a scene-art
@@ -7763,11 +7397,9 @@ def _rewrite_cover_prompt_for_policy(
         temperature=0.45,
         max_tokens=int(config.get("cover_prompt_max_tokens", 1400) or 1400),
     )
-    series_label = (
+    series_label = marketing_display_text(
         str((metadata or {}).get("series_cover_label") or "").strip()
-        if bool(config.get("series_animation_enabled", True))
-        else ""
-    )
+    ) if bool(config.get("series_animation_enabled", True)) else ""
     series_instruction = (
         f'Keep the exact series identifier "{series_label}" and count it inside the total 5-7 editorial text groups.\n\n'
         if series_label
@@ -8339,12 +7971,12 @@ def regenerate_job_cover(
     metadata = _read_json(job_dir / "metadata.json", {})
     if not isinstance(metadata, dict):
         metadata = {}
-    if ensure_marketing and not _metadata_has_marketing_candidates(metadata):
+    if ensure_marketing:
         saved_context = _read_json(job_dir / "story_visual_context.json", {})
         story_context = saved_context.get("context") if isinstance(saved_context, dict) else {}
         if not isinstance(story_context, dict):
             story_context = {}
-        on_log("manual cover regeneration: old/missing marketing metadata; generate 3 titles, 2 synopses and tags first")
+        on_log("manual cover regeneration: validate marketing cache against current rewritten text")
         metadata = stage_metadata(
             novel,
             job_dir,
@@ -8466,15 +8098,12 @@ def regenerate_job_marketing(
         metadata = stage_metadata(novel, job_dir, story_context, segments=segments, on_log=on_log)
         metadata = apply_series_presentation(metadata, job_dir, on_log=on_log)
         _write_json(job_dir / "metadata.json", metadata)
-    except Exception as exc:
+    except Exception:
         for path in generated_paths:
             path.unlink(missing_ok=True)
         for path, content in backups.items():
             path.write_bytes(content)
-        on_log(
-            "manual marketing regeneration failed; restored previous title/synopsis files; reason: "
-            + redact_secret_text(exc)
-        )
+        on_log("manual marketing regeneration failed; restored previous title/synopsis files")
         raise
 
     on_log("manual marketing regeneration completed; next upload will choose from the new titles")
@@ -9465,7 +9094,6 @@ def stage_upload(
 
         for index, profile in enumerate(profiles, start=1):
             title_template = str(profile.get("title_template") or config.youtube_title_template or "{candidate_title}")
-            template_owns_episode_range = _template_uses_source_episode_range(title_template)
             description_template = str(profile.get("description") or config.youtube_description or "")
             flow = _normalize_upload_flow(profile.get("flow") or config.browser_flow or "simple")
             visibility = str(profile.get("visibility") or config.youtube_visibility or "PRIVATE").strip().upper()
@@ -9503,11 +9131,7 @@ def stage_upload(
                 selected = _strip_series_part_prefix(str(profile_context.get("candidate_title") or clean_title))
                 profile_context["candidate_title"] = f"{series_prefix}｜{selected}"
                 profile_context["short_title"] = profile_context["candidate_title"]
-            elif (
-                not template_owns_episode_range
-                and series_animation_enabled_for_job(job_dir)
-                and str(metadata.get("series_upload_prefix") or "").strip()
-            ):
+            elif series_animation_enabled_for_job(job_dir) and str(metadata.get("series_upload_prefix") or "").strip():
                 # Automatic series presentation is derived from the completed
                 # normal titles.  Keep the series/part prefix even when the
                 # channel has no manually configured series profile.
@@ -9532,11 +9156,7 @@ def stage_upload(
                 prefix = f"{series_title}｜{episode_label}｜" if episode_label else f"{series_title}｜"
                 if not upload_title.startswith(prefix):
                     upload_title = _limit_upload_title(prefix + upload_title, title_limit) or prefix.rstrip("｜")
-            elif (
-                not template_owns_episode_range
-                and series_animation_enabled_for_job(job_dir)
-                and str(metadata.get("series_upload_prefix") or "").strip()
-            ):
+            elif series_animation_enabled_for_job(job_dir) and str(metadata.get("series_upload_prefix") or "").strip():
                 prefix = str(metadata.get("series_upload_prefix") or "").strip()
                 if not upload_title.startswith(prefix):
                     upload_title = _limit_upload_title(prefix + upload_title, title_limit) or prefix.rstrip("｜")
@@ -9553,43 +9173,6 @@ def stage_upload(
                 ),
                 title_limit,
             )
-            ab_test_titles: list[str] = []
-            if bool(config.get("youtube_ab_test_enabled", False)) and not upload_title_override.strip():
-                raw_candidates = metadata.get("titles") if isinstance(metadata.get("titles"), list) else []
-                raw_candidates = [_strip_series_part_prefix(str(value)) for value in raw_candidates]
-                raw_candidates = [value for value in raw_candidates if value][:3]
-                if len(raw_candidates) == 3:
-                    generated_tags = _safe_generated_tags_for_upload(
-                        metadata.get("generated_tags") or metadata.get("generated_tag_line") or [],
-                        title, job_dir.name, metadata.get("clean_title"), metadata.get("short_title"),
-                        metadata.get("intro"), metadata.get("story_brief"),
-                    )
-                    for candidate in raw_candidates:
-                        candidate_context = dict(profile_context)
-                        candidate_context["candidate_title"] = candidate
-                        candidate_context["short_title"] = candidate
-                        candidate_title = _limit_upload_title(
-                            _format_template(title_template, candidate_context, fallback=candidate), title_limit
-                        ) or candidate
-                        if series_title and series_episode:
-                            prefix = f"{series_title}｜{episode_label}｜" if episode_label else f"{series_title}｜"
-                            if not candidate_title.startswith(prefix):
-                                candidate_title = _limit_upload_title(prefix + candidate_title, title_limit) or prefix.rstrip("｜")
-                        elif (
-                            not template_owns_episode_range
-                            and series_animation_enabled_for_job(job_dir)
-                            and str(metadata.get("series_upload_prefix") or "").strip()
-                        ):
-                            prefix = str(metadata.get("series_upload_prefix") or "").strip()
-                            if not candidate_title.startswith(prefix):
-                                candidate_title = _limit_upload_title(prefix + candidate_title, title_limit) or prefix.rstrip("｜")
-                        ab_test_titles.append(
-                            _append_generated_tags_to_upload_title(candidate_title, generated_tags, title_limit)
-                        )
-                    if len(set(ab_test_titles)) != 3:
-                        raise RuntimeError("A/B 测试生成后出现重复标题，请调整标题模板或候选标题")
-                else:
-                    on_log("  WARN A/B 测试已启用，但没有 3 个可用候选标题；本次按普通标题上传")
             # A scheduled Short intentionally carries the already-published
             # main video's exact title, including its chosen candidate/tags.
             if upload_title_override.strip():
@@ -9644,7 +9227,6 @@ def stage_upload(
                 schedule_enabled=schedule_enabled,
                 scheduled_at=scheduled_at,
                 schedule_timezone=schedule_timezone,
-                ab_test_titles=ab_test_titles,
                 job=browser_upload_job,
                 on_log=on_log,
                 on_progress=_profile_progress,
@@ -10200,36 +9782,8 @@ def run_full(
         imported_audio_mode = (job_dir / IMPORTED_AUDIO_MANIFEST).exists()
         novel = _read_saved_novel(job_dir / "novel.json") if resume else None
         segments = _read_saved_segments(job_dir / "segments.json") if resume else None
-        pronunciation_redo = resume and (job_dir / TTS_INLINE_PRONUNCIATION_REDO_FILE).exists()
         if novel is not None and segments is not None:
-            if pronunciation_redo:
-                plain_segments = [
-                    Segment(index=segment.index, text=_strip_inline_pronunciation_annotations(segment.text))
-                    for segment in segments
-                ]
-                plain_text = "\n".join(segment.text for segment in plain_segments).strip()
-                log("resume: force full-text inline pronunciation API review before rebuilding all TTS")
-                pronunciation_result = timed(
-                    "2b_inline_pronunciation_redo", _generate_auto_pronunciation_dictionary,
-                    plain_text, on_log=log, job_dir=job_dir, force=True,
-                )
-                if not pronunciation_result.get("path"):
-                    raise RuntimeError("整篇正文读音 API 未返回可用标注，任务已停止，未使用未标音正文继续制作 TTS")
-                source = Path(pronunciation_result["path"]).read_text(encoding="utf-8-sig")
-                entries = parse_pronunciation_dictionary(source)
-                segments = []
-                marked_total = 0
-                for segment in plain_segments:
-                    marked_text, marked = _add_inline_pronunciation_annotations(segment.text, entries)
-                    marked_total += marked
-                    segments.append(Segment(index=segment.index, text=marked_text))
-                if not marked_total:
-                    raise RuntimeError("整篇正文读音 API 没有匹配到任何汉字标注，任务已停止")
-                _write_json(job_dir / "segments.json", [{"i": s.index, "text": s.text} for s in segments])
-                (job_dir / TTS_INLINE_PRONUNCIATION_REDO_FILE).unlink(missing_ok=True)
-                log(f"  自动正文读音重新标注完成：{marked_total} 处")
-            else:
-                log(f"resume: reuse saved source and {len(segments)} cleaned segments")
+            log(f"resume: reuse saved source and {len(segments)} cleaned segments")
             progress("tts", 0.15, title=novel.title)
         else:
             progress("scrape", 0.03)
@@ -10255,28 +9809,15 @@ def run_full(
             )
             _apply_series_title_to_novel(novel, job_dir, log)
             _write_json(job_dir / "segments.json", [{"i": s.index, "text": s.text} for s in segments])
-            if pronunciation_redo:
-                if not (job_dir / TTS_AUTO_PRONUNCIATION_DICTIONARY).exists():
-                    raise RuntimeError("整篇正文读音 API 未生成有效标注，任务已停止")
-                (job_dir / TTS_INLINE_PRONUNCIATION_REDO_FILE).unlink(missing_ok=True)
         _validate_job_novel_source(job_dir, novel, segments)
-        # A full TTS redo is media-only: it must not alter existing marketing
-        # copy, cover instructions, character references, or scene images.
-        tts_redo_reuse_images = (job_dir / TTS_REDO_REUSE_IMAGES_FILE).exists()
-        if tts_redo_reuse_images:
-            story_context = _read_json(job_dir / "story_visual_context.json", {})
-            metadata = _read_json(job_dir / "metadata.json", {})
-            character_analysis = _read_json(job_dir / "character_profiles.json", {})
-            log("full TTS redo: preserve existing title, synopsis, cover, images, and character artifacts")
-        else:
-            story_context = timed("3_story_context", stage_story_context, novel, segments, job_dir, on_log=log)
-            metadata = timed("4_metadata", stage_metadata, novel, job_dir, story_context, segments=segments, on_log=log)
-            if series_animation_enabled_for_job(job_dir):
-                metadata = apply_series_presentation(metadata, job_dir, on_log=log)
-                _write_json(job_dir / "metadata.json", metadata)
-            character_analysis = timed("5_character_analysis", stage_character_analysis, novel, segments, job_dir, on_log=log)
-            character_analysis = share_series_character_analysis(job_dir, character_analysis, on_log=log)
-            character_analysis = timed("5b_character_references", stage_character_references, character_analysis, job_dir, on_log=log)
+        story_context = timed("3_story_context", stage_story_context, novel, segments, job_dir, on_log=log)
+        metadata = timed("4_metadata", stage_metadata, novel, job_dir, story_context, segments=segments, on_log=log)
+        if series_animation_enabled_for_job(job_dir):
+            metadata = apply_series_presentation(metadata, job_dir, on_log=log)
+            _write_json(job_dir / "metadata.json", metadata)
+        character_analysis = timed("5_character_analysis", stage_character_analysis, novel, segments, job_dir, on_log=log)
+        character_analysis = share_series_character_analysis(job_dir, character_analysis, on_log=log)
+        character_analysis = timed("5b_character_references", stage_character_references, character_analysis, job_dir, on_log=log)
         progress("tts", 0.15, title=novel.title)
         start_acceleration_preprocess_next(
             source_job_id=job_id,
@@ -10286,6 +9827,7 @@ def run_full(
 
         # A user-selected fallback means this resumed job must spend effort on
         # missing TTS only; it must never start another image API request.
+        tts_redo_reuse_images = (job_dir / TTS_REDO_REUSE_IMAGES_FILE).exists()
         image_fallback_mode = _image_fallback_mode(job_dir)
         even_image_count = len(_valid_scene_images(job_dir)) if image_fallback_mode else None
         # A resumed task already has durable audio and image artifacts.  Do not
@@ -10571,8 +10113,8 @@ def _fallback_storyboard_prompt(text: str) -> str:
     prompt = (
         f"{prefix} "
         "Depict only the story's stated world, era, characters, costumes, and setting. "
-        "Keep the configured Japanese light-novel illustration style, faithfully follow the story's stated world and era, "
-        "and do not import people, places, settings, costumes, or historical eras from an unrelated story. "
+        "Keep the illustration style consistent with this video's source material; do not import people, places, eras, "
+        "or genre conventions from an unrelated story. "
         f"{config.llm_image_style_suffix}. "
         # Keep the concrete narration at the end: the safe prompt length cap
         # intentionally preserves the tail as well as the global style lock.
