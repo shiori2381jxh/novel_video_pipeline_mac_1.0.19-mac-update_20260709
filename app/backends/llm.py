@@ -74,7 +74,22 @@ class LLMBackend:
         except Exception as exc:
             raise RuntimeError(redact_secret_text(exc)) from exc
         data = r.json()
-        prompt = data["choices"][0]["message"]["content"].strip()
+        choice = data["choices"][0]
+        message = choice["message"]
+        content = message.get("content")
+        # Reasoning-capable models can spend the entire max_tokens allowance
+        # before emitting visible content.  Returning an empty string hides
+        # that condition and makes every structured caller report a misleading
+        # JSON parse error, so preserve the gateway's completion reason here.
+        if content is None or not str(content).strip():
+            finish_reason = str(choice.get("finish_reason") or "unknown")
+            usage = data.get("usage") if isinstance(data, dict) else None
+            completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+            detail = f", completion_tokens={completion_tokens}" if completion_tokens is not None else ""
+            raise RuntimeError(
+                f"Text API returned empty assistant content (finish_reason={finish_reason}{detail})"
+            )
+        prompt = str(content).strip()
         if self.style_suffix and self.style_suffix.lower() not in prompt.lower():
             prompt = f"{prompt}, {self.style_suffix}"
         return prompt

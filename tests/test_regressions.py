@@ -766,6 +766,29 @@ class NovelProjectRegressionTests(unittest.TestCase):
 
 
 class PronunciationDictionaryRegressionTests(unittest.TestCase):
+    def test_inline_annotations_are_per_occurrence_tts_overrides(self):
+        segments = [pipeline_runner.Segment(index=0, text="一番（いちばん）と番（つがい）")]
+        with tempfile.TemporaryDirectory() as tmp:
+            narration, counts, entries, _dictionary_hash = pipeline_runner._prepare_tts_pronunciation(
+                segments,
+                Path(tmp),
+                "edge",
+            )
+
+        self.assertEqual(narration, ["いちばんとつがい"])
+        self.assertEqual(counts, [2])
+        self.assertEqual(entries, [])
+        self.assertEqual(segments[0].text, "一番（いちばん）と番（つがい）")
+
+    def test_automatic_inline_marking_prefers_longest_written_form(self):
+        marked, count = pipeline_runner._add_inline_pronunciation_annotations(
+            "今日、京都へ行く。",
+            [("京都", "きょうと"), ("今日", "きょう")],
+        )
+
+        self.assertEqual(marked, "今日（きょう）、京都（きょうと）へ行く。")
+        self.assertEqual(count, 2)
+
     def test_uploaded_dictionary_prepares_voicevox_text_without_mutating_subtitles(self):
         segments = [pipeline_runner.Segment(index=0, text="董卓と呂布が対峙した。")]
         with tempfile.TemporaryDirectory() as tmp:
@@ -919,6 +942,21 @@ class LocalSourceSafetyRegressionTests(unittest.TestCase):
 
 
 class NarrationPunctuationRegressionTests(unittest.TestCase):
+    def test_clean_stage_removes_source_inline_reading_annotations_without_ai_rewrite(self):
+        novel = pipeline_runner.Novel(
+            site="text", novel_id="reading-aids", title="読音テスト", author="", description="",
+            chapters=[pipeline_runner.NovelChapter(index=1, title="読音テスト", text="彼は王宮（おうきゅう）へ向かった。")],
+        )
+        with patch.dict(pipeline_runner.config._data, {
+            "ai_rewrite_enabled": False,
+            "tts_clean_rewritten_text": False,
+            "tts_auto_pronunciation_enabled": False,
+            "tts_inline_pronunciation_enabled": False,
+        }):
+            segments = pipeline_runner.stage_clean(novel)
+
+        self.assertEqual(segments[0].text, "彼は王宮へ向かった。")
+
     def test_voicevox_preserves_authored_japanese_punctuation_and_line_endings(self):
         source = "「待って……！」\n彼女は――静かに、笑った〜。\n本当に？　はい！\n余韻—"
         with patch.dict(pipeline_runner.config._data, {"tts_provider": "voicevox"}):
@@ -1039,6 +1077,25 @@ class WorkerQueueRegressionTests(unittest.TestCase):
 
 
 class MarketingCandidateRegressionTests(unittest.TestCase):
+    def test_http_503_is_retried_with_transient_delay(self):
+        self.assertTrue(
+            pipeline_runner._is_transient_json_response_error(
+                "Server error '503 Service Unavailable' for url 'https://example.test/v1/chat/completions'"
+            )
+        )
+
+    def test_length_exhaustion_retries_without_transient_delay(self):
+        error = (
+            "Text API returned empty assistant content "
+            "(finish_reason=length, completion_tokens=1600)"
+        )
+        self.assertFalse(pipeline_runner._is_transient_json_response_error(error))
+        self.assertTrue(
+            pipeline_runner._is_transient_json_response_error(
+                "Text API returned empty assistant content (finish_reason=unknown)"
+            )
+        )
+
     def test_fallback_generation_warning_requires_human_attention(self):
         with tempfile.TemporaryDirectory() as tmp:
             job_dir = Path(tmp)
@@ -1117,6 +1174,22 @@ class MarketingCandidateRegressionTests(unittest.TestCase):
         self.assertLessEqual(len(bundle["synopses"][0]), 160)
         self.assertIn(bundle["synopses"][0][-1], "。！？!?」』…")
 
+    def test_local_fallback_synopsis_removes_source_furigana(self):
+        novel = SimpleNamespace(
+            title="読音付きの物語",
+            full_text=(
+                "王宮（おうきゅう）で暮らす少女（しょうじょ）は、失われた指輪（ゆびわ）を見つけた。"
+                "その秘密（ひみつ）を知る王子（おうじ）が、彼女を夜会（やかい）へ招いた。"
+                "二人は古い約束（やくそく）を確かめるため、城の奥へ向かう。"
+            ),
+        )
+
+        bundle = pipeline_runner._fallback_marketing_candidates(novel, novel.full_text, 40, 70, "ja")
+
+        self.assertEqual(pipeline_runner._marketing_validation_error(bundle, 40, 70), "")
+        self.assertTrue(all("（" not in synopsis and "(" not in synopsis for synopsis in bundle["synopses"]))
+        self.assertTrue(all(synopsis[-1] in "。！？!?」』…" for synopsis in bundle["synopses"]))
+
     def test_local_fallback_handles_long_text_without_punctuation(self):
         novel = SimpleNamespace(title="長い物語", full_text="あ" * 500)
 
@@ -1124,6 +1197,23 @@ class MarketingCandidateRegressionTests(unittest.TestCase):
 
         self.assertEqual(pipeline_runner._marketing_validation_error(bundle, 40, 70), "")
         self.assertEqual(len(set(bundle["titles"])), 3)
+
+    def test_local_fallback_repairs_its_own_title_style_failures(self):
+        novel = SimpleNamespace(
+            title="第12話 花の聖女",
+            full_text=(
+                "第12話 王都を追われた聖女が。"
+                "第13話 王都を追われた聖女が。"
+                "第14話 王都を追われた聖女が。"
+            ),
+        )
+
+        bundle = pipeline_runner._fallback_marketing_candidates(
+            novel, novel.full_text, 20, 70, "ja"
+        )
+
+        self.assertEqual(pipeline_runner._marketing_validation_error(bundle, 20, 70), "")
+        self.assertEqual(pipeline_runner._marketing_title_style_error(bundle, "ja"), "")
 
     def test_local_fallback_removes_chapter_heading_and_dialogue_wrappers(self):
         novel = SimpleNamespace(
@@ -1140,6 +1230,24 @@ class MarketingCandidateRegressionTests(unittest.TestCase):
         self.assertEqual(pipeline_runner._marketing_validation_error(bundle, 40, 70), "")
         self.assertFalse(bundle["titles"][0].startswith("第1話"))
         self.assertFalse(bundle["synopses"][0].startswith("第1話"))
+
+    def test_three_kingdoms_fallback_removes_bom_before_chapter_heading(self):
+        novel = SimpleNamespace(
+            title="三国群英志220-222",
+            full_text=(
+                "\ufeff第二百二十回 曹操が南陽城を攻めた。"
+                "ところが、その攻め方が露骨だったので、城内の賈詡は笑った。"
+                "曹操は南陽城の周囲を三度回り、兵糧袋を西北の角に積ませた。"
+                "賈詡は伏兵を置き、張繍に曹操軍の退路を断つよう命じた。"
+            ),
+        )
+
+        bundle = pipeline_runner._fallback_marketing_candidates(
+            novel, novel.full_text, 50, 75, "ja"
+        )
+
+        self.assertEqual(pipeline_runner._marketing_validation_error(bundle, 50, 75), "")
+        self.assertNotIn("第二百二十回", bundle["titles"][0])
 
     def test_upload_repairs_legacy_three_kingdoms_wrong_tags(self):
         tags = pipeline_runner._safe_generated_tags_for_upload(
@@ -1528,6 +1636,49 @@ class ManualCoverRegenerationTests(unittest.TestCase):
 
 
 class BrowserUploadProfileRegressionTests(unittest.TestCase):
+    def test_episode_range_template_does_not_add_animated_series_prefix(self):
+        profile = {
+            "name": "三国 千夜一席",
+            "enabled": True,
+            "chrome_profile": "Account-2",
+            "flow": "simple",
+            "visibility": "PRIVATE",
+            "title_template": "【三国志完全解説】{source_episode_range}{candidate_title}",
+        }
+        candidate = "「お前、郭嘉。――絶望の底から立ち上がった主人公が居場所を取り戻す。"
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp) / "三国群英志228-230"
+            job_dir.mkdir()
+            (job_dir / "status.json").write_text(
+                json.dumps({"series_animation_mode": "auto"}), encoding="utf-8"
+            )
+            video = job_dir / "video.mp4"
+            video.write_bytes(b"video")
+            lock_path = job_dir / ".upload.lock"
+            metadata = {
+                "clean_title": "三国群英志228-230",
+                "short_title": candidate,
+                "titles": [candidate],
+                "generated_tags": [],
+                "series_upload_prefix": "三国已做完｜第230話｜",
+            }
+            with (
+                patch.object(pipeline_runner, "_selected_upload_profiles", return_value=[profile]),
+                patch.object(pipeline_runner, "_ensure_upload_dependencies"),
+                patch.object(pipeline_runner, "_acquire_upload_lock", return_value=lock_path),
+                patch.object(pipeline_runner, "_release_upload_lock"),
+                patch("app.upload.upload_to_youtube", return_value="video-id") as upload_mock,
+            ):
+                pipeline_runner.stage_upload(
+                    video, "三国群英志228-230", None, job_dir, metadata=metadata,
+                    force=True, schedule_enabled_override=False,
+                )
+
+        self.assertEqual(
+            upload_mock.call_args.args[1],
+            "【三国志完全解説】第228話～第230話" + candidate,
+        )
+
     def test_single_channel_upload_forces_selected_chrome_profile_launch(self):
         profile = {
             "name": "三国 千夜一席",

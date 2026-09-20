@@ -66,6 +66,7 @@ def upload_to_youtube(video_path: Path, title: str, description: str = "",
                        schedule_enabled: bool = False,
                        scheduled_at: str = "",
                        schedule_timezone: str = "Asia/Tokyo",
+                       ab_test_titles: Optional[list[str]] = None,
                        job: Optional[_Job] = None,
                        on_log: Callable = print,
                        on_progress: Callable = lambda x: None) -> Optional[str]:
@@ -89,6 +90,7 @@ def upload_to_youtube(video_path: Path, title: str, description: str = "",
         youtube_schedule_enabled=bool(schedule_enabled),
         youtube_scheduled_at=str(scheduled_at or ""),
         youtube_schedule_timezone=str(schedule_timezone or "Asia/Tokyo"),
+        youtube_ab_test_titles=list(ab_test_titles or []),
     )
     profile = {
         "name": browser_active_profile or "novel",
@@ -103,6 +105,7 @@ def upload_to_youtube(video_path: Path, title: str, description: str = "",
         "schedule_enabled": bool(schedule_enabled),
         "scheduled_at": str(scheduled_at or ""),
         "schedule_timezone": str(schedule_timezone or "Asia/Tokyo"),
+        "ab_test_titles": list(ab_test_titles or []),
     }
     try:
         return mod.upload_via_browser(

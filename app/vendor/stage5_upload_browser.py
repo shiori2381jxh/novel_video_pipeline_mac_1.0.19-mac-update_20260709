@@ -590,6 +590,7 @@ def upload_via_browser(job, config, video_path: Path, title: str,
     scheduled_at = str(profile.get("scheduled_at") or "")
     schedule_timezone = str(profile.get("schedule_timezone") or "Asia/Tokyo")
     desc_override = profile.get("description", "")
+    ab_test_titles = profile.get("ab_test_titles") or getattr(config, "youtube_ab_test_titles", []) or []
     chrome_profile = str(profile.get("chrome_profile") or getattr(config, "browser_chrome_profile", "Default") or "Default").strip()
     ad_suitability_template = normalize_ad_suitability_template(
         profile.get("ad_suitability_template") or getattr(config, "browser_ad_suitability_template", "")
@@ -661,7 +662,7 @@ def upload_via_browser(job, config, video_path: Path, title: str,
             flow, ad_interval, ad_start, upload_policy, visibility,
             desc_override, delays, stall_timeout_min, ad_suitability_template,
             on_log, on_progress, chrome_profile, expected_channel_name, expected_channel_id,
-            schedule_enabled, scheduled_at, schedule_timezone,
+            schedule_enabled, scheduled_at, schedule_timezone, ab_test_titles,
         )
 
         if job.is_cancelled():
@@ -720,7 +721,8 @@ def _run_upload_session(job, config, video_path, title, cover_path,
                         flow, ad_interval, ad_start, upload_policy, visibility,
                         desc_override, delays, stall_timeout_min, ad_suitability_template,
                         on_log, on_progress, chrome_profile, expected_channel_name, expected_channel_id,
-                        schedule_enabled=False, scheduled_at="", schedule_timezone="Asia/Tokyo"):
+                        schedule_enabled=False, scheduled_at="", schedule_timezone="Asia/Tokyo",
+                        ab_test_titles=None):
     """
     单次 Playwright 会话：连接 Chrome，尝试上传，返回 video_id / None / _STALL / 'CHROME_CRASH'
     """
@@ -771,6 +773,10 @@ def _run_upload_session(job, config, video_path, title, cover_path,
 
         upload_page = None
         try:
+            # A GUI/browser restart can leave a completed processing overlay in
+            # an older Studio tab.  It is no longer owned by any upload worker,
+            # so dismiss it before opening the next per-item tab.
+            _dismiss_stale_processing_dialogs(ctx, on_log)
             # Keep the signed-in Studio tab and the Chrome process intact.
             # Each item gets its own temporary upload tab, which is closed
             # only after that item finishes (or fails).  The next item can
@@ -780,7 +786,11 @@ def _run_upload_session(job, config, video_path, title, cover_path,
             on_log("已打开本条视频的上传标签页（Chrome 和登录状态会继续保留）")
             _reset_youtube_studio_runtime_cache(ctx, page, on_log)
 
-            _MAX_UPLOAD_RETRY = 3
+            # A scheduled upload can already exist as a private draft before
+            # the final Schedule action is committed. Re-running the complete
+            # flow would upload the same file again, so scheduled uploads are
+            # strictly single-attempt and require Studio review on failure.
+            _MAX_UPLOAD_RETRY = 1 if schedule_enabled else 3
             for _attempt in range(1, _MAX_UPLOAD_RETRY + 1):
                 if job.is_cancelled():
                     on_log("上传已取消")
@@ -812,6 +822,7 @@ def _run_upload_session(job, config, video_path, title, cover_path,
                         schedule_enabled=schedule_enabled,
                         scheduled_at=scheduled_at,
                         schedule_timezone=schedule_timezone,
+                        ab_test_titles=ab_test_titles,
                     )
                 except _UploadPolicyConfirmError as e:
                     on_log(f"  ⚠️ {e}，刷新浏览器后重新走上传流程...")
@@ -844,7 +855,10 @@ def _run_upload_session(job, config, video_path, title, cover_path,
                     on_log(f"  上传失败，稍后重试...")
                     time.sleep(3)
 
-            on_log("❌ 上传重试 3 次均失败")
+            if schedule_enabled:
+                on_log("⚠️ 定时上传未完成；为避免重复草稿，未自动重传")
+            else:
+                on_log("❌ 上传重试 3 次均失败")
             return None
         finally:
             if upload_page is not None:
@@ -925,6 +939,49 @@ def _verify_studio_channel(page, expected_channel_name: str, expected_channel_id
     return True
 
 
+def _configure_title_ab_test(page, titles, delays: "_Delays", on_log: Callable) -> None:
+    """Configure Studio's native title A/B test while the details dialog is open."""
+    clean_titles = [str(value).strip() for value in titles if str(value).strip()]
+    if not clean_titles:
+        return
+    if len(clean_titles) != 3 or len(set(clean_titles)) != 3:
+        raise RuntimeError("A/B 测试需要 3 个互不相同的非空标题")
+
+    on_log("设置标题 A/B 测试（3 个候选标题）...")
+    ab_button = page.locator('button[aria-label="A/B 测试"], button[aria-label="A/B Test"]').first
+    try:
+        ab_button.wait_for(state="visible", timeout=10_000)
+        ab_button.click()
+    except Exception as exc:
+        raise RuntimeError(f"未找到或无法点击 A/B 测试按钮: {exc}") from exc
+
+    page.wait_for_timeout(delays.step_between)
+    for index, value in enumerate(clean_titles, start=1):
+        box = page.locator(
+            f'[contenteditable="true"][aria-label="添加标题 {index}"], '
+            f'[contenteditable="true"][aria-label="Add title {index}"]'
+        ).first
+        try:
+            box.wait_for(state="visible", timeout=10_000)
+            box.click()
+            page.evaluate(
+                "el => { el.textContent = ''; el.dispatchEvent(new Event('input', {bubbles:true})); }",
+                box.element_handle(),
+            )
+            box.type(value, delay=delays.type_delay)
+        except Exception as exc:
+            raise RuntimeError(f"无法填写 A/B 标题 {index}: {exc}") from exc
+
+    setup_button = page.locator('button[aria-label="设置测试"], button[aria-label="Set up test"]').first
+    try:
+        setup_button.wait_for(state="visible", timeout=10_000)
+        setup_button.click()
+        page.wait_for_timeout(delays.click_after)
+    except Exception as exc:
+        raise RuntimeError(f"无法确认 A/B 测试设置: {exc}") from exc
+    on_log("  ✓ 标题 A/B 测试已设置")
+
+
 def _do_upload(page, job, config, video_path: Path, title: str,
                cover_path: Optional[Path],
                ad_interval: int, ad_start: int, upload_policy: str,
@@ -940,7 +997,8 @@ def _do_upload(page, job, config, video_path: Path, title: str,
                expected_channel_id: str = "",
                schedule_enabled: bool = False,
                scheduled_at: str = "",
-               schedule_timezone: str = "Asia/Tokyo") -> Optional[str]:
+               schedule_timezone: str = "Asia/Tokyo",
+               ab_test_titles: list[str] | None = None) -> Optional[str]:
     from playwright.sync_api import TimeoutError as PWTimeout
 
     if delays is None:
@@ -968,7 +1026,15 @@ def _do_upload(page, job, config, video_path: Path, title: str,
     if expected_channel_id:
         clean_url = f"https://studio.youtube.com/channel/{expected_channel_id}"
         current_match = re.search(r"studio\.youtube\.com/channel/([^/?#]+)", page.url)
-        if not current_match or current_match.group(1) != expected_channel_id:
+        # Every upload owns this newly-created temporary tab.  Always reset it
+        # to the clean channel home before looking for Create; a previous
+        # /videos/upload route can keep an old dialog/overlay alive and has no
+        # usable header Create control.
+        if (
+            not current_match or
+            current_match.group(1) != expected_channel_id or
+            page.url.rstrip("/") != clean_url
+        ):
             page.goto(clean_url, timeout=TIMEOUT)
     elif not re.search(r"studio\.youtube\.com/channel/[^/]+/?$", page.url):
         channel_m = re.search(r"studio\.youtube\.com/channel/([^/?]+)", page.url)
@@ -990,16 +1056,6 @@ def _do_upload(page, job, config, video_path: Path, title: str,
             except PWTimeout:
                 on_log("❌ 登录超时")
                 return None
-
-    ctx = page.context
-    for p in ctx.pages:
-        channel_match = re.search(r"studio\.youtube\.com/channel/([^/?#]+)", p.url)
-        if channel_match and p != page and (
-            not expected_channel_id or channel_match.group(1) == expected_channel_id
-        ):
-            on_log("  切换到 Studio 活跃 tab")
-            page = p
-            break
 
     page.wait_for_load_state("domcontentloaded", timeout=TIMEOUT)
     on_log(f"✓ Studio 已就绪: {page.url}")
@@ -1060,6 +1116,8 @@ def _do_upload(page, job, config, video_path: Path, title: str,
         )
         title_inner.type(title, delay=delays.type_delay)
         page.wait_for_timeout(300)
+
+        _configure_title_ab_test(page, ab_test_titles or [], delays, on_log)
 
         if desc:
             desc_box = page.locator(
@@ -1187,6 +1245,10 @@ def _do_upload(page, job, config, video_path: Path, title: str,
 
     if video_id == _STALL:
         return _STALL
+
+    if video_id == "SCHEDULE_UNCONFIRMED":
+        on_log("⚠️ 预定点击结果尚未确认；已停止本条任务且不会重传，请到 Studio 检查当前视频")
+        return video_id
 
     done_label = "预定" if schedule_enabled else ("发布" if visibility == "PUBLIC" else "保存")
     on_log(f"✓ 视频已{done_label}，video_id: {video_id}")
@@ -2466,7 +2528,7 @@ def _click_schedule_checking_notice(page) -> Optional[dict]:
     operator clicks “知道了” (Got it).
     """
     try:
-        return page.evaluate("""async () => {
+        js_result = page.evaluate("""async () => {
             function visible(el) {
                 if (!el || !el.getBoundingClientRect) return false;
                 const r = el.getBoundingClientRect();
@@ -2549,8 +2611,36 @@ def _schedule_upload_immediately(page, job, scheduled_at: str,
         on_log("上传已取消")
         return None
 
-    on_log("日期和时间已填写，点击预定后会等待上传稳定再继续...")
+    on_log("日期和时间已填写，等待左下角显示“上传完毕”后再点击预定...")
     page.wait_for_timeout(700)
+
+    # A visible Schedule button is not proof that Studio will accept it.  In
+    # current Studio builds the host can look enabled while the file transfer
+    # is still running, and force-clicking it simply does nothing.  Treat the
+    # bottom-left upload status as the authoritative gate.
+    upload_ready = bool(upload_state.get("complete"))
+    last_upload_pct = None
+    while time.time() < deadline and not upload_ready:
+        if job.is_cancelled():
+            on_log("上传已取消")
+            return None
+        info = _read_upload_progress(page)
+        phase = str(info.get("phase") or "") if info else ""
+        pct = info.get("pct") if info else None
+        if phase in {"checking", "processing", "complete"} or pct == 100:
+            upload_ready = True
+            upload_state["complete"] = True
+            break
+        if pct is not None and pct != last_upload_pct:
+            on_log(f"上传进度: {pct}%（达到上传完毕后再预定）")
+            last_upload_pct = pct
+            _emit_upload_progress(upload_state, min(82, 60 + int(float(pct) * 0.22)), on_progress)
+        page.wait_for_timeout(2_000)
+
+    if not upload_ready:
+        on_log("❌ 等待上传完毕超时，未点击预定")
+        return None
+    on_log("✓ 已检测到“上传完毕”，现在定位并点击预定按钮...")
 
     def response_state() -> str:
         try:
@@ -2575,71 +2665,43 @@ def _schedule_upload_immediately(page, job, scheduled_at: str,
                     /we(?:'|’)re still checking your content/i.test(text) ||
                     /we are still checking your content/i.test(text)
                 ) return 'checking-notice';
+                const processingDialog = Array.from(document.querySelectorAll(
+                    'ytcp-uploads-still-processing-dialog, ytcp-video-share-dialog, ' +
+                    'ytcp-dialog, tp-yt-paper-dialog, [role="dialog"]'
+                )).filter(visible).find(el => /正在处理视频|正在處理影片|processing video/i.test(
+                    (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim()
+                ));
+                if (processingDialog) return 'processing-dialog';
                 return '';
             }""") or "")
         except Exception:
             return ""
 
     click_accepted = False
-    click_deadline = min(deadline, time.time() + 30)
-    attempt = 0
+    click_attempted = False
+    click_attempts = 0
+    last_schedule_target = None
+    click_deadline = min(deadline, time.time() + 90)
     while time.time() < click_deadline and not click_accepted:
         if job.is_cancelled():
             on_log("上传已取消")
             return None
 
-        # Studio exposes the unique final action as #done-button.  Resolve
-        # its native button first; text/aria matching is only a fallback.
-        schedule_button = page.locator(
-            'ytcp-button#done-button button, #done-button button'
-        ).first
-        try:
-            if not (
-                schedule_button.is_visible(timeout=500) and
-                schedule_button.is_enabled(timeout=500)
-            ):
-                schedule_button = None
-        except Exception:
-            schedule_button = None
-        if schedule_button is None:
-            schedule_button = _find_enabled_upload_action_button(
-                page, schedule_enabled=True, visibility="PUBLIC"
-            )
-        if schedule_button is None:
-            page.wait_for_timeout(300)
+        # Chrome 149 can leave stale #done-button nodes in the document. Only
+        # click a target whose centre resolves back into the same button;
+        # otherwise the coordinates may land on the modal backdrop.
+        schedule_target = _schedule_button_target(page)
+        last_schedule_target = schedule_target
+        if not schedule_target or not schedule_target.get("enabled"):
+            page.wait_for_timeout(500)
+            continue
+        click_attempts += 1
+        click_attempted = _click_schedule_button_once(page, schedule_target, on_log)
+        if not click_attempted:
+            page.wait_for_timeout(500)
             continue
 
-        attempt += 1
-        method = "按钮点击"
-        clicked = False
-        try:
-            if attempt % 3 == 1:
-                method = "#done-button 强制目标点击"
-                schedule_button.click(timeout=5_000, force=True)
-                clicked = True
-            elif attempt % 3 == 2:
-                method = "#done-button DOM 点击"
-                clicked = bool(page.evaluate("""() => {
-                    const host = document.querySelector('ytcp-button#done-button');
-                    if (!host) return false;
-                    const button = host.querySelector('button');
-                    if (!button) return false;
-                    button.click();
-                    return true;
-                }"""))
-            else:
-                method = "#done-button 键盘确认"
-                schedule_button.focus()
-                page.keyboard.press("Enter")
-                clicked = True
-        except Exception as exc:
-            on_log(f"  第 {attempt} 次{method}未完成: {exc}")
-
-        if not clicked:
-            page.wait_for_timeout(300)
-            continue
-
-        state_deadline = min(click_deadline, time.time() + 3)
+        state_deadline = min(deadline, time.time() + 30)
         state = ""
         while time.time() < state_deadline:
             state = response_state()
@@ -2648,25 +2710,35 @@ def _schedule_upload_immediately(page, job, scheduled_at: str,
             page.wait_for_timeout(200)
         if state:
             click_accepted = True
-            on_log(f"  ✓ 第 {attempt} 次{method}已被页面接受（{state}）")
+            on_log(f"  ✓ 预定点击已被页面接受（{state}）")
             break
-
-        on_log(f"  ⚠️ 第 {attempt} 次{method}后页面无变化，重新获取预定按钮再试")
+        if click_attempts >= 3:
+            break
+        on_log(f"  ⚠️ 第 {click_attempts} 次点击后页面无变化，重新定位真实预定按钮")
 
     if not click_accepted:
-        on_log("❌ 已找到“预定”按钮，但连续点击后 YouTube Studio 页面仍无响应")
-        return None
+        if click_attempted:
+            on_log("⚠️ 已点击“预定”，但未确认到页面反馈；为避免重复上传，请到 Studio 检查")
+            return "SCHEDULE_UNCONFIRMED"
+        if last_schedule_target:
+            on_log(
+                "⚠️ 上传完毕后未能安全点击“预定”，不会自动重传；"
+                f"host={last_schedule_target.get('hostTag')} "
+                f"surface={last_schedule_target.get('surfaceTag')} "
+                f"top={last_schedule_target.get('topTag')} "
+                f"aria-disabled={last_schedule_target.get('hostAriaDisabled')}"
+            )
+        else:
+            on_log("⚠️ 上传完毕后未找到“预定”按钮，不会自动重传")
+        return "SCHEDULE_UNCONFIRMED"
 
     _emit_upload_progress(upload_state, 88, on_progress)
-    # The Schedule action is often accepted while the file is still uploading
-    # (for example, Studio may show 61% with seconds remaining).  Keep this
-    # page alive for 30 seconds before dismissing its dialogs or moving to the
-    # next item, so Studio can finish committing the upload.  The total wait
-    # is capped at 35 seconds, preserving batch throughput if processing is
-    # slow or the UI does not expose a reliable percentage.
+    # The file transfer is complete at this point, but keep the page alive
+    # briefly so Studio can commit the reservation and expose its confirmation
+    # or processing dialog before we close the per-item tab.
     settle_until = min(deadline, time.time() + 30)
     cleanup_deadline = min(deadline, time.time() + 35)
-    on_log("预约已提交，等待约 30 秒让 YouTube 上传并保存，再关闭页面进入下一个视频...")
+    on_log("预约已提交，等待 YouTube 保存并显示确认结果，再关闭页面进入下一个视频...")
 
     notice_logged = False
     settle_logged = False
@@ -2842,6 +2914,40 @@ def _close_scheduled_confirmation_dialog(page) -> Optional[dict]:
     dialog.  Clicking a matching element alone is insufficient: only report
     success once the actual confirmation dialog has disappeared.
     """
+    def _confirmation_visible() -> bool:
+        try:
+            return bool(page.evaluate("""() => Array.from(document.querySelectorAll(
+                'ytcp-video-share-dialog, ytcp-dialog, tp-yt-paper-dialog, [role="dialog"]'
+            )).some(el => {
+                const r = el.getBoundingClientRect();
+                const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                return r.width > 0 && r.height > 0 && (
+                    text.includes('已安排好视频发布时间') || text.includes('已安排好影片發布時間') ||
+                    /video publish time (?:has been )?scheduled/i.test(text) || /video scheduled/i.test(text)
+                );
+            })"""))
+        except Exception:
+            return False
+
+    # Chrome 149 renders the actionable surface as an unnamed
+    # ytcp-button-shape inside ytcp-button#close-button.  Target that exact
+    # two-layer structure before attempting label-based fallbacks.
+    for selector, method in (
+        ('ytcp-video-share-dialog ytcp-button#close-button ytcp-button-shape', 'scheduled-close-shape'),
+        ('ytcp-video-share-dialog ytcp-button#close-button', 'scheduled-close-host'),
+        ('ytcp-dialog ytcp-button#close-button ytcp-button-shape', 'dialog-close-shape'),
+        ('ytcp-dialog ytcp-button#close-button', 'dialog-close-host'),
+    ):
+        try:
+            control = page.locator(selector).first
+            if control.is_visible(timeout=600):
+                control.click(timeout=1_500, force=True)
+                page.wait_for_timeout(700)
+                if not _confirmation_visible():
+                    return {"clicked": True, "dismissed": True, "method": method}
+        except Exception:
+            pass
+
     try:
         result = page.evaluate("""async () => {
             function visible(el) {
@@ -2915,7 +3021,13 @@ def _close_scheduled_confirmation_dialog(page) -> Optional[dict]:
 
 
 def _close_still_processing_dialog(page) -> Optional[dict]:
-    """Close YouTube's still-processing upload dialog with the exact close button."""
+    """Close YouTube's still-processing dialog across old and new Studio DOMs.
+
+    The current Studio no longer consistently gives the footer ``ytcp-button``
+    an id of ``close-button``.  Locate the control by its accessible/text label
+    inside the processing dialog instead, while retaining the old selectors as
+    fast paths.
+    """
     from playwright.sync_api import TimeoutError as PWTimeout
 
     dialog_selector = (
@@ -2946,17 +3058,140 @@ def _close_still_processing_dialog(page) -> Optional[dict]:
         except Exception:
             return False
 
-    try:
-        close_btn = page.locator(native_selector).first
-        if close_btn.is_visible(timeout=800):
+    # Prefer the exact current two-layer control before any text lookup.  The
+    # inner shape is visible but reports a generic role and no accessible name.
+    for selector, method in (
+        (shape_selector, "processing-close-shape"),
+        (host_selector, "processing-close-host"),
+        (native_selector, "native-close-button"),
+    ):
+        try:
+            close_btn = page.locator(selector).first
+            if not close_btn.is_visible(timeout=800):
+                continue
             close_btn.click(timeout=1_500, force=True)
             page.wait_for_timeout(400)
             if not _still_visible():
                 return {
                     "clicked": True,
                     "dismissed": True,
-                    "method": "native-close-button",
+                    "method": method,
                 }
+        except Exception:
+            continue
+
+    # New Studio builds render a plain ytcp-button whose only useful identity
+    # is the visible label held by ytcp-button-shape (as in the Chinese
+    # "关闭" button).  Resolve both the dialog and the control by text so this
+    # does not accidentally click Chrome's own "restore page" bubble.
+    try:
+        box = page.evaluate("""() => {
+            const visible = el => {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                    s.display !== 'none' && s.visibility !== 'hidden';
+            };
+            const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
+            const dialogs = Array.from(document.querySelectorAll(
+                'ytcp-uploads-still-processing-dialog, ytcp-dialog, tp-yt-paper-dialog, [role="dialog"]'
+            )).filter(visible);
+            const dialog = dialogs.find(el => /正在处理视频|正在處理影片|processing video/i.test(
+                clean(el.innerText || el.textContent)
+            ));
+            if (!dialog) return { gone: true };
+
+            const controls = Array.from(dialog.querySelectorAll(
+                'ytcp-button, tp-yt-paper-button, button, [role="button"], ytcp-button-shape'
+            )).filter(visible);
+            const label = el => clean([
+                el.getAttribute && el.getAttribute('aria-label'),
+                el.getAttribute && el.getAttribute('title'),
+                el.innerText,
+                el.textContent
+            ].filter(Boolean).join(' ')).toLowerCase();
+            const exact = /^(关闭|關閉|close|完成|done|finish)$/i;
+            let control = controls.find(el => exact.test(label(el)));
+            if (!control) {
+                control = controls.find(el => /关闭|關閉|\\bclose\\b|完成|\\bdone\\b|\\bfinish\\b/i.test(label(el)));
+            }
+            if (!control) return { gone: false, found: false };
+
+            // Prefer the owning button when the matching label came from the
+            // nested shape, then click its visual centre through Playwright.
+            const owner = control.closest('ytcp-button, tp-yt-paper-button, button, [role="button"]') || control;
+            const target = owner.querySelector('button, [role="button"], ytcp-button-shape') || owner;
+            const r = target.getBoundingClientRect();
+            return {
+                gone: false,
+                found: true,
+                x: Math.max(1, Math.min(window.innerWidth - 1, r.left + r.width / 2)),
+                y: Math.max(1, Math.min(window.innerHeight - 1, r.top + r.height / 2)),
+                label: label(owner),
+            };
+        }""")
+        if box and box.get("gone"):
+            return {"clicked": False, "dismissed": True, "method": "already-gone"}
+        if box and box.get("found"):
+            page.mouse.click(box["x"], box["y"])
+            page.wait_for_timeout(700)
+            if not _still_visible():
+                return {
+                    "clicked": True,
+                    "dismissed": True,
+                    "method": "labelled-close-control",
+                    "label": box.get("label", ""),
+                }
+            # Polymer sometimes ignores the synthesized mouse click but reacts
+            # to an event dispatched on the owning ytcp-button.
+            js_clicked = page.evaluate("""() => {
+                const visible = el => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
+                const dialog = Array.from(document.querySelectorAll(
+                    'ytcp-uploads-still-processing-dialog, ytcp-dialog, tp-yt-paper-dialog, [role="dialog"]'
+                )).filter(visible).find(el => /正在处理视频|正在處理影片|processing video/i.test(
+                    clean(el.innerText || el.textContent)
+                ));
+                if (!dialog) return true;
+                const label = el => clean([
+                    el.getAttribute && el.getAttribute('aria-label'),
+                    el.getAttribute && el.getAttribute('title'),
+                    el.innerText,
+                    el.textContent
+                ].filter(Boolean).join(' '));
+                const controls = Array.from(dialog.querySelectorAll(
+                    'ytcp-button, tp-yt-paper-button, button, [role="button"], ytcp-button-shape'
+                )).filter(visible);
+                const match = controls.find(el => /关闭|關閉|\\bclose\\b|完成|\\bdone\\b|\\bfinish\\b/i.test(label(el)));
+                if (!match) return false;
+                const owner = match.closest('ytcp-button, tp-yt-paper-button, button, [role="button"]') || match;
+                for (const el of [owner, match]) {
+                    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                        try {
+                            const EventType = type.startsWith('pointer') && window.PointerEvent ? PointerEvent : MouseEvent;
+                            el.dispatchEvent(new EventType(type, { bubbles: true, cancelable: true, composed: true }));
+                        } catch (_) {}
+                    }
+                    try { el.click(); } catch (_) {}
+                }
+                return true;
+            }""")
+            if js_clicked:
+                page.wait_for_timeout(700)
+                if not _still_visible():
+                    return {
+                        "clicked": True,
+                        "dismissed": True,
+                        "method": "labelled-close-events",
+                        "label": box.get("label", ""),
+                    }
     except Exception:
         pass
 
@@ -3118,8 +3353,44 @@ def _close_still_processing_dialog(page) -> Optional[dict]:
                 method: 'js-close-button'
             };
         }""")
+        if js_result and js_result.get("dismissed"):
+            return js_result
     except Exception:
-        return None
+        pass
+
+    # A few revisions attach dismissal only to the dialog keyboard handler.
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(600)
+        if not _still_visible():
+            return {"clicked": True, "dismissed": True, "method": "escape"}
+    except Exception:
+        pass
+    return {"clicked": False, "dismissed": not _still_visible()}
+
+
+def _dismiss_stale_processing_dialogs(context, on_log: Callable) -> None:
+    """Dismiss completed processing overlays left by an interrupted worker."""
+    for existing_page in list(getattr(context, "pages", ())):
+        try:
+            if "studio.youtube.com" not in str(existing_page.url or ""):
+                continue
+            visible = existing_page.evaluate("""() => {
+                const d = document.querySelector('ytcp-uploads-still-processing-dialog');
+                if (!d || d.offsetParent === null) return false;
+                const text = (d.innerText || d.textContent || '').replace(/\\s+/g, ' ').trim();
+                return /正在处理视频|正在處理影片|processing video/i.test(text) &&
+                    /检查完毕|檢查完畢|checks? complete|no issues found/i.test(text);
+            }""")
+            if not visible:
+                continue
+            result = _close_still_processing_dialog(existing_page)
+            if result and result.get("dismissed"):
+                on_log("已清理上次中断后遗留的“正在处理视频”弹窗")
+            else:
+                on_log("检测到上次遗留的处理弹窗；无法关闭，但不会影响新上传标签页")
+        except Exception:
+            continue
 
 
 def _schedule_date_labels(value: datetime) -> list[str]:
@@ -3315,6 +3586,142 @@ def _select_upload_visibility(page, visibility: str, on_log: Callable) -> bool:
         return True
     except PWTimeout:
         on_log(f"  ⚠️ 未找到「{label}」选项，请手动选择")
+        return False
+
+
+def _schedule_button_target(page) -> Optional[dict]:
+    """Return the real visible Schedule click surface and its state.
+
+    YouTube's current ``ytcp-button`` host can report enabled and accept a
+    synthetic ``click()`` without forwarding it to the unnamed inner
+    ``ytcp-button-shape``.  Coordinates on that shape match a manual click.
+    """
+    try:
+        return page.evaluate("""() => {
+            const visible = el => {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                    s.display !== 'none' && s.visibility !== 'hidden';
+            };
+            const uploadDialogs = Array.from(document.querySelectorAll(
+                'ytcp-uploads-dialog, ytcp-video-upload-dialog'
+            )).filter(visible);
+            // Studio may retain an older upload dialog in the DOM. The last
+            // visible dialog is the current topmost upload modal.
+            const roots = uploadDialogs.length ? [uploadDialogs[uploadDialogs.length - 1]] : [document];
+            const hosts = roots.flatMap(root => Array.from(root.querySelectorAll(
+                'ytcp-button#done-button, #done-button'
+            ))).filter(visible);
+            const labelMatches = el => {
+                const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const aria = (el.getAttribute('aria-label') || '').trim();
+                return /预定|預定|schedule/i.test(text + ' ' + aria);
+            };
+            const belongsTo = (top, host) => {
+                let node = top;
+                while (node) {
+                    if (node === host || host.contains(node)) return true;
+                    const root = node.getRootNode ? node.getRootNode() : null;
+                    node = root && root.host ? root.host : null;
+                }
+                return false;
+            };
+            const candidates = hosts.filter(labelMatches).concat(hosts.filter(el => !labelMatches(el))).reverse();
+            let fallback = null;
+            for (const host of candidates) {
+                const shape = host.querySelector('ytcp-button-shape');
+                const native = (shape && shape.shadowRoot &&
+                    shape.shadowRoot.querySelector('button, [role="button"]')) ||
+                    host.querySelector('button, [role="button"]');
+                const surface = native && visible(native) ? native : (shape && visible(shape) ? shape : host);
+                const r = surface.getBoundingClientRect();
+                const x = r.left + r.width / 2;
+                const y = r.top + r.height / 2;
+                if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) continue;
+                const top = document.elementFromPoint(x, y);
+                const disabled =
+                    host.hasAttribute('disabled') ||
+                    host.getAttribute('aria-disabled') === 'true' ||
+                    (native && (native.disabled === true || native.getAttribute('aria-disabled') === 'true'));
+                const result = {
+                    enabled: !disabled,
+                    hitTestPassed: belongsTo(top, host),
+                    x, y,
+                    hostAriaDisabled: host.getAttribute('aria-disabled'),
+                    hostTag: host.tagName,
+                    surfaceTag: surface.tagName,
+                    topTag: top ? top.tagName : '',
+                    text: (host.innerText || host.textContent || '').replace(/\\s+/g, ' ').trim(),
+                };
+                if (!disabled && labelMatches(host)) return result;
+                if (!fallback) fallback = result;
+            }
+            if (!fallback) return null;
+            return { ...fallback, enabled: false };
+        }""")
+    except Exception:
+        return None
+
+
+def _click_schedule_button_once(page, target: dict, on_log: Callable) -> bool:
+    """Click the current upload dialog's real Schedule control once."""
+    try:
+        on_log(
+            "  预定按钮状态: "
+            f"host={target.get('hostTag')} surface={target.get('surfaceTag')} "
+            f"top={target.get('topTag')} aria-disabled={target.get('hostAriaDisabled')}"
+        )
+        # In Studio's top-layer Polymer dialog, document.elementFromPoint can
+        # report the backdrop even for the visibly painted shadow-DOM button.
+        # In that case dispatch the click through the exact current-dialog
+        # hierarchy copied from DevTools instead of trusting page coordinates.
+        if not target.get("hitTestPassed"):
+            clicked = bool(page.evaluate("""() => {
+                const visible = el => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const dialogs = Array.from(document.querySelectorAll(
+                    'ytcp-uploads-dialog, ytcp-video-upload-dialog'
+                )).filter(visible);
+                const root = dialogs.length ? dialogs[dialogs.length - 1] : document;
+                const hosts = Array.from(root.querySelectorAll(
+                    'ytcp-button#done-button, #done-button'
+                )).filter(visible).filter(host => {
+                    const label = [host.innerText, host.textContent, host.getAttribute('aria-label')]
+                        .filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                    return /预定|預定|schedule/i.test(label);
+                });
+                const host = hosts[hosts.length - 1];
+                if (!host || host.hasAttribute('disabled') || host.getAttribute('aria-disabled') === 'true') {
+                    return false;
+                }
+                const shape = host.querySelector('ytcp-button-shape');
+                const native = (shape && shape.shadowRoot &&
+                    shape.shadowRoot.querySelector('button, [role="button"]')) ||
+                    host.querySelector('button, [role="button"]');
+                const control = native || shape || host;
+                control.click();
+                return true;
+            }"""))
+            if clicked:
+                on_log("  已通过当前上传弹窗内的真实预定按钮执行 DOM 点击")
+                return True
+            return False
+
+        page.mouse.move(float(target["x"]), float(target["y"]))
+        page.wait_for_timeout(100)
+        page.mouse.down()
+        page.wait_for_timeout(80)
+        page.mouse.up()
+        return True
+    except Exception as exc:
+        on_log(f"  ⚠️ 预定按钮物理点击失败: {exc}")
         return False
 
 
@@ -3588,7 +3995,9 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
             page.wait_for_timeout(1200)
 
     video_id = None
-    _dialog_closed = False  # 标记弹窗是否已成功关闭（弹窗关闭=发布/预约完成）
+    # True means Studio has visibly accepted the publish/schedule action.  A
+    # processing dialog itself is confirmation; dismissal is only UI cleanup.
+    _dialog_closed = False
 
     # 处理"正在检查/正在处理"弹窗：完整流程可能会检查较久，持续重试弹窗里的发布按钮。
     # 背景：点"确认发布"后 YouTube 需要数秒才弹出此弹窗，且弹窗存在时 URL 不会跳转
@@ -3625,9 +4034,13 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
                 on_log("  ✓ 已关闭正在处理/上传弹窗")
                 _dialog_closed = True
                 break
-            on_log("  ⚠️ 正在处理/上传弹窗仍在，继续尝试关闭...")
-            page.wait_for_timeout(2000)
-            continue
+            # Reaching this post-submit dialog proves that Studio accepted the
+            # action.  Do not wait ten minutes or retry the whole upload merely
+            # because a future Studio DOM revision prevents UI cleanup; the
+            # per-item tab is closed safely by _run_upload_session finally.
+            on_log("  ⚠️ 已确认上传提交成功，但处理弹窗未能关闭；关闭本条标签页并继续，避免重复上传")
+            _dialog_closed = True
+            break
 
         if schedule_enabled:
             schedule_notice = _click_schedule_checking_notice(page)
@@ -3728,9 +4141,9 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
                 on_log("  ✓ 已关闭上传中弹窗")
                 _dialog_closed = True
                 break  # 继续走下面的方法取 video_id
-            on_log("  ⚠️ 上传中弹窗仍在，继续尝试关闭...")
-            page.wait_for_timeout(2000)
-            continue
+            on_log("  ⚠️ 已确认上传提交成功，但弹窗未能关闭；关闭本条标签页并继续，避免重复上传")
+            _dialog_closed = True
+            break
         # 检查 URL 是否已跳转（有时没有弹窗直接跳转）
         if re.search(r"studio\.youtube\.com/video/([A-Za-z0-9_-]{11})", page.url):
             break

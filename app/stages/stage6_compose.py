@@ -23,6 +23,10 @@ from app.utils.ffmpeg import ffmpeg_path
 
 MOTION_RANDOM_POOL = ["vertical_pan", "horizontal_pan", "ken_burns", "pan_up", "pan_down", "pan_left", "pan_right"]
 TRANSITION_RANDOM_POOL = ["none", "fade", "fadeblack", "fadewhite"]
+_INLINE_PRONUNCIATION_SUFFIX_RE = re.compile(
+    r"(?<=[\u3400-\u9fff々〆ヶぁ-ゖァ-ヺー・])\s*[（(]\s*"
+    r"[ぁ-ゖァ-ヺー・]+\s*[）)]"
+)
 
 
 @lru_cache(maxsize=1)
@@ -931,7 +935,8 @@ def _split_text_to_fit(text: str, chars_per_line: int, max_lines: int) -> list[s
 
 
 def _normalize_subtitle_text(text: str) -> str:
-    value = html.unescape(text or "")
+    # 「一番（いちばん）」 displays as 「一番」; the TTS path receives kana.
+    value = _INLINE_PRONUNCIATION_SUFFIX_RE.sub("", html.unescape(text or ""))
     value = re.sub(r"[，,]+", "，", value)
     value = re.sub(r"[。\.]+", "。", value)
     value = re.sub(r"[！？!?；;：:、]+", " ", value)

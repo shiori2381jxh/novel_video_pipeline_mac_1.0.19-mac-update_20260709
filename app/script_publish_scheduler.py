@@ -99,7 +99,7 @@ def _ordered_candidates(job_statuses: list[tuple[str, dict]]) -> list[tuple[str,
         match = re.search(r"_(\d{8}_\d{6})(?:_\d+)?$", job_id)
         return ((match.group(1) if match else "99999999_999999"), job_id)
     for job_id, status in job_statuses:
-        if str(status.get("youtube_url") or "").strip():
+        if str(status.get("youtube_url") or "").strip() or bool(status.get("youtube_manually_marked_uploaded")):
             continue
         series, episode, display = infer_series(status, job_id)
         key = series.casefold() if episode else f"__single__{job_id}"

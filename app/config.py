@@ -30,7 +30,7 @@ DEFAULTS_DIR.mkdir(exist_ok=True)
 PRONUNCIATION_DICTIONARIES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 58
+SETTINGS_SCHEMA_VERSION = 59
 DEFAULT_YOUTUBE_TITLE_TEMPLATE = "{candidate_title}"
 DEFAULT_YOUTUBE_DESCRIPTION = ""
 RELEASE_REPOSITORY = "shiori2381jxh/novel_video_pipeline_mac_1.0.19-mac-update_20260709"
@@ -373,6 +373,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "请把输入的小说正文改写成适合中文/日文推文长视频旁白的版本："
         "保留原剧情、人物关系、事件顺序、情绪转折和关键设定，不新增剧情，不改变结局；"
         "去掉生硬网页痕迹、重复废话、作者口癖和不适合朗读的表达；"
+        "输入中即使带有汉字（かな）/漢字(かな)形式的读音注释，输出正文也必须去除注释，仅保留汉字原文；"
         "语言更顺、更有悬念和画面感，适合 TTS 朗读；"
         "保持段落分隔，不要输出标题、解释、编号、标签或 JSON，只输出改写后的正文。"
     ),
@@ -381,6 +382,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Off is the unattended-safe default.  When enabled, the text LLM creates
     # a TTS-only reading map and a second pass checks it before synthesis.
     "tts_auto_pronunciation_enabled": False,
+    "tts_inline_pronunciation_enabled": False,
     "tts_auto_pronunciation_max_terms": 300,
     # A durable vocabulary belongs to the production profile (for example,
     # 三国配置1), not to one individual job.
@@ -640,6 +642,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "script_schedule_unfinished_action": "next_slot",
     "youtube_title_template": DEFAULT_YOUTUBE_TITLE_TEMPLATE,
     "youtube_title_max_chars": 100,
+    # When enabled, submit all three generated marketing titles through
+    # YouTube Studio's native title A/B test dialog after the video is uploaded.
+    "youtube_ab_test_enabled": False,
     "youtube_description": DEFAULT_YOUTUBE_DESCRIPTION,
     "youtube_tags": "",
     "browser_flow": "simple",
@@ -1046,6 +1051,8 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
             int(data["longform_default_min_final_chars"]),
             int(data["longform_default_max_final_chars"]),
         )
+    if saved_version < 59:
+        data.setdefault("tts_inline_pronunciation_enabled", False)
     if saved_version < 23:
         for key in (
             "marketing_title_min_chars",
@@ -1249,6 +1256,20 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
             '"synopses":["あらすじ1","あらすじ2"]}',
             '"synopses":["あらすじ1","あらすじ2"],"tags":["#タグ1","#タグ2","#タグ3"]}',
         )
+    # The metadata validator requires two independently usable synopses.  A
+    # few older bundled/user profiles mistakenly instructed the model to make
+    # only one, which made otherwise valid title bundles fall into the generic
+    # local fallback path.  Upgrade both the prose requirement and JSON shape
+    # together so the instruction cannot contradict the validator again.
+    marketing_prompt = re.sub(
+        r"(概要欄用あらすじを(?:必ず)?)(?:1|１)案(作り|、)",
+        r"\g<1>2案\2",
+        marketing_prompt,
+    )
+    marketing_prompt = marketing_prompt.replace(
+        '"synopses":["あらすじ1"],"tags"',
+        '"synopses":["あらすじ1","あらすじ2"],"tags"',
+    )
     data["marketing_candidates_prompt"] = marketing_prompt
     data["settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
