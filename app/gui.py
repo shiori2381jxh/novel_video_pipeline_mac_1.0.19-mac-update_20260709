@@ -1209,9 +1209,18 @@ class PipelineGUI:
         queue_pane.pack(fill=tk.BOTH, expand=True)
 
         toolbar_box = ttk.Frame(queue_pane, padding=4)
-        ttk.Button(toolbar_box, text="启动", command=self._start_jobs, style="Primary.TButton").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar_box, text="清空已结束任务", command=self._delete_finished_jobs).pack(side=tk.LEFT)
-        ttk.Button(toolbar_box, text="停止", command=self._stop_jobs).pack(side=tk.LEFT, padx=(6, 0))
+        self.job_selection_count_var = tk.StringVar(value="已选中 0 个任务")
+        ttk.Label(
+            toolbar_box,
+            textvariable=self.job_selection_count_var,
+            font=(UI_FONT, UI_SMALL_FONT_SIZE, "bold"),
+            foreground="#1f5f91",
+        ).pack(anchor=tk.W, padx=4, pady=(0, 3))
+        action_bar = ttk.Frame(toolbar_box)
+        action_bar.pack(fill=tk.X)
+        ttk.Button(action_bar, text="启动", command=self._start_jobs, style="Primary.TButton").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(action_bar, text="清空已结束任务", command=self._delete_finished_jobs).pack(side=tk.LEFT)
+        ttk.Button(action_bar, text="停止", command=self._stop_jobs).pack(side=tk.LEFT, padx=(6, 0))
 
         cols = ("job_id", "stage", "short", "progress", "worker", "audio", "dictionary", "title", "video", "scheduled_at", "youtube")
         tree_box = ttk.Frame(queue_pane)
@@ -8525,6 +8534,7 @@ class PipelineGUI:
             self.job_tree.yview_moveto(yview[0])
         if xview:
             self.job_tree.xview_moveto(xview[0])
+        self._update_job_selection_count()
         self._job_table_refresh_key = poll_key
         if category_active:
             self._next_category_table_refresh_at = time.monotonic() + 10.0
@@ -8880,7 +8890,14 @@ class PipelineGUI:
         pr.set_image_fallback_selection(job_id, "cycle" if answer else "hold_last")
         return True
 
+    def _update_job_selection_count(self):
+        if not hasattr(self, "job_selection_count_var"):
+            return
+        count = len(self.job_tree.selection())
+        self.job_selection_count_var.set(f"已选中 {count} 个任务")
+
     def _on_job_select(self, _event=None):
+        self._update_job_selection_count()
         ids = self._selected_job_ids()
         if ids:
             if ids[0] != self._selected_job:
